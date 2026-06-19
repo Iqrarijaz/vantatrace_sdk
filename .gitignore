@@ -1,0 +1,18 @@
+# Dependency directories
+node_modules/
+
+# Compilation build output
+dist/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System files
+.DS_Store
+Thumbs.db

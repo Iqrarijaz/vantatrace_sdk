@@ -1,0 +1,36 @@
+{
+  "name": "@vantatrace/sdk",
+  "version": "0.1.1",
+  "description": "Drop-in observability SDK for Node.js microservices powering error tracking, structured logging, and real-time telemetry pipelines.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "observability",
+    "error-tracking",
+    "logging",
+    "telemetry",
+    "nodejs",
+    "microservices",
+    "monitoring",
+    "crash-reporting",
+    "exception-handling",
+    "debugging",
+    "apm",
+    "distributed-systems",
+    "vantatrace"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Iqrarijaz/vantatrace_sdk.git"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
