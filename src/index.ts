@@ -13,16 +13,30 @@ export class VantaTrace {
   constructor(options: VantaTraceOptions) {
     this.apiKey = options.apiKey || '';
     this.serviceName = options.serviceName || 'unknown-service';
-
-    let envInput = options.environment || process.env.NODE_ENV || 'development';
-    if (this.apiKey.includes('live')) {
-      envInput = 'live';
-    } else if (this.apiKey.includes('test')) {
-      envInput = 'test';
-    }
-
-    this.environment = (envInput === 'production' || envInput === 'prod' || envInput === 'live') ? 'live' : 'test';
     this.debug = !!options.debug;
+
+    // Determine environment strictly based on the API Key
+    if (this.apiKey) {
+      if (this.apiKey.includes('live')) {
+        this.environment = 'live';
+      } else if (this.apiKey.includes('test')) {
+        this.environment = 'test';
+      } else {
+        this.environment = 'test';
+      }
+
+      // Enforce sync: If environment option was supplied, validate it against resolved key environment
+      if (options.environment) {
+        const resolvedEnv = (options.environment === 'production' || options.environment === 'prod' || options.environment === 'live') ? 'live' : 'test';
+        if (resolvedEnv !== this.environment) {
+          throw new Error(`[VantaTrace] Configuration Error: API key and environment mismatch. Cannot use environment "${options.environment}" with API key "${this.apiKey}".`);
+        }
+      }
+    } else {
+      // Dry-run mode: default to 'test' or fallback to env options
+      const envInput = options.environment || process.env.NODE_ENV || 'development';
+      this.environment = (envInput === 'production' || envInput === 'prod' || envInput === 'live') ? 'live' : 'test';
+    }
 
     // Default to localhost:6000/api/events (Standard Ingestion Endpoint)
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';

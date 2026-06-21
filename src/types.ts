@@ -1,6 +1,7 @@
 export interface VantaTraceOptions {
   apiKey: string;
   serviceName: string;
+  /** @deprecated Environment is automatically determined by the API Key. */
   environment?: string;
   debug?: boolean;
   apiUrl?: string;

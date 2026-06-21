@@ -36,15 +36,17 @@ npm install @vantatrace/sdk
 
 ## ⚡ Quick Start
 
+First, sign up and get your API keys from [https://api.vantatrace.com](https://api.vantatrace.com) to get started.
+
 ### 1. Initialize SDK
 
 ``` javascript
 import { VantaTrace } from '@vantatrace/sdk';
 
 const vantaTrace = new VantaTrace({
-  apiKey: 'YOUR_PROJECT_API_KEY',
+  apiKey: 'YOUR_PROJECT_API_KEY', // Get your API Key from https://api.vantatrace.com (starts with ep_live_ or ep_test_)
   serviceName: 'order-service',
-  environment: 'production',
+  // Note: environment is automatically determined from your API key prefix (ep_live_ -> live, ep_test_ -> test)
   debug: false
 });
 ```
