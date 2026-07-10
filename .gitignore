@@ -16,3 +16,6 @@ yarn-error.log*
 # System files
 .DS_Store
 Thumbs.db
+
+# Subagent-driven-development scratch state
+.superpowers/
