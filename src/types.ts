@@ -1,8 +1,5 @@
 export interface VantaTraceOptions {
   apiKey: string;
-  serviceName: string;
-  /** @deprecated Environment is automatically determined by the API Key. */
-  environment?: string;
   debug?: boolean;
   apiUrl?: string;
 }
@@ -17,11 +14,20 @@ export interface VantaTraceContext {
   severity?: 'critical' | 'warning' | 'info';
 }
 
+/** Normalized cause chain entry for errors thrown with { cause: originalError }. */
+export interface NormalizedCause {
+  name: string;
+  message: string;
+  stack: string;
+  code?: string;
+  statusCode?: number;
+}
+
 export interface ErrorPayload {
   apiKey: string;
-  serviceName: string;
-  environment: string;
   timestamp: string;
+  /** Unique trace ID generated per capture — links Winston / logger entries with the same error event. */
+  traceId: string;
   error: {
     message: string;
     stack: string;
@@ -30,6 +36,8 @@ export interface ErrorPayload {
     code?: string;
     statusCode?: number;
     extra?: Record<string, any>;
+    /** Original error(s) from the cause chain (native `Error.cause` or manual `{ cause }` patterns). */
+    cause?: NormalizedCause[];
   };
   context: VantaTraceContext;
   system: {

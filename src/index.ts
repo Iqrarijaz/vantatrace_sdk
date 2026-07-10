@@ -1,44 +1,49 @@
+import { AsyncLocalStorage } from 'async_hooks';
+import * as crypto from 'crypto';
 import { VantaTraceOptions, VantaTraceContext, ErrorPayload } from './types';
 import { normalizeError } from './normalizer';
-import { getSystemContext } from './context';
+import { getSystemContext, startTelemetrySampling } from './context';
 import { sendPayload } from './transport';
+import { createWinstonTransport } from './winston';
+import { registerGlobalInstance } from './registry';
 
 export class VantaTrace {
   private apiKey: string;
-  private serviceName: string;
-  private environment: string;
   private debug: boolean;
   private apiUrl: string;
 
+  // native AsyncLocalStorage store to capture request context
+  private static asyncLocalStorage = new AsyncLocalStorage<VantaTraceContext>();
+  // Memory leak-proof duplicate filter
+  private reportedErrors = new WeakSet<any>();
+  // Reentrance guard: prevents infinite loops when SDK debug logging
+  // triggers a monkey-patched logger, which would re-enter captureException.
+  // Per-context via ALS when inside a request scope; global fallback for
+  // uncaughtException / console.error calls outside any request.
+  private _globalReentranceGuard = false;
+
+  /** Check if an error capture is already in progress for this async context. */
+  private _isCapturing(): boolean {
+    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    if (store) return !!store._vantaCapturing;
+    return this._globalReentranceGuard;
+  }
+
+  /** Set/clear the capture-in-progress flag for the current async context. */
+  private _setCapturing(value: boolean): void {
+    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    if (store) {
+      store._vantaCapturing = value;
+    } else {
+      this._globalReentranceGuard = value;
+    }
+  }
+
   constructor(options: VantaTraceOptions) {
     this.apiKey = options.apiKey || '';
-    this.serviceName = options.serviceName || 'unknown-service';
     this.debug = !!options.debug;
 
-    // Determine environment strictly based on the API Key
-    if (this.apiKey) {
-      if (this.apiKey.includes('live')) {
-        this.environment = 'live';
-      } else if (this.apiKey.includes('test')) {
-        this.environment = 'test';
-      } else {
-        this.environment = 'test';
-      }
-
-      // Enforce sync: If environment option was supplied, validate it against resolved key environment
-      if (options.environment) {
-        const resolvedEnv = (options.environment === 'production' || options.environment === 'prod' || options.environment === 'live') ? 'live' : 'test';
-        if (resolvedEnv !== this.environment) {
-          throw new Error(`[VantaTrace] Configuration Error: API key and environment mismatch. Cannot use environment "${options.environment}" with API key "${this.apiKey}".`);
-        }
-      }
-    } else {
-      // Dry-run mode: default to 'test' or fallback to env options
-      const envInput = options.environment || process.env.NODE_ENV || 'development';
-      this.environment = (envInput === 'production' || envInput === 'prod' || envInput === 'live') ? 'live' : 'test';
-    }
-
-    // Default to localhost:6000/api/events (Standard Ingestion Endpoint)
+    // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
 
     if (!options.apiKey && this.debug) {
@@ -46,14 +51,38 @@ export class VantaTrace {
     }
 
     if (this.debug) {
-      console.log(`[VantaTrace] Initialized SDK for service "${this.serviceName}" on environment "${this.environment}".`);
+      console.log(`[VantaTrace] Initialized SDK.`);
     }
+
+    // Start background system telemetry sampler (runs every 10 seconds, unrefed)
+    startTelemetrySampling(10000);
+
+    registerGlobalInstance(this, this.debug);
+  }
+
+  /**
+   * Generate a lightweight hex trace ID for cross-cutting correlation.
+   * Links Winston/Pino log entries with the same VantaTrace error event on the dashboard.
+   */
+  private _generateTraceId(): string {
+    return crypto.randomBytes(16).toString('hex');
+  }
+
+  /**
+   * Get the trace ID associated with the current request context, if any.
+   * Useful for linking custom Winston/Pino logger entries to VantaTrace error events.
+   */
+  public static getActiveTraceId(): string | undefined {
+    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    return store?.traceId;
   }
 
   /**
    * Primary method to capture exceptions and send them to VantaTrace
    */
   public captureException(error: any, context?: VantaTraceContext): void {
+    if (this._isCapturing()) return;
+
     try {
       if (!this.apiKey) {
         if (this.debug) {
@@ -62,22 +91,72 @@ export class VantaTrace {
         return;
       }
 
+      // Deduplicate exceptions to prevent double reporting
+      if (error && typeof error === 'object') {
+        if (this.reportedErrors.has(error)) return;
+        this.reportedErrors.add(error);
+      }
+
+      this._setCapturing(true);
+
       const normalized = normalizeError(error);
       const systemContext = getSystemContext();
 
+      // Auto-extract request-level context from AsyncLocalStorage store
+      const activeStore = VantaTrace.asyncLocalStorage.getStore() as any;
+      
+      // Retrieve or generate trace ID bound to this asynchronous context
+      let traceId: string;
+      if (activeStore) {
+        if (!activeStore.traceId) {
+          activeStore.traceId = this._generateTraceId();
+        }
+        traceId = activeStore.traceId;
+      } else {
+        traceId = this._generateTraceId();
+      }
+
+      const activeStoreCopy = activeStore || {};
+      
+      // Dynamically resolve properties from request reference if active
+      let dynamicUserId: string | undefined = undefined;
+      let dynamicRoute: string | undefined = undefined;
+      if (activeStoreCopy.req) {
+        const reqRef = activeStoreCopy.req;
+        if (reqRef.user && typeof reqRef.user === 'object') {
+          dynamicUserId = reqRef.user.id || reqRef.user._id || reqRef.user.userId;
+        } else if (reqRef.userId) {
+          dynamicUserId = reqRef.userId;
+        }
+        dynamicRoute = reqRef.route?.path || reqRef.path || reqRef.url;
+      }
+
+      const mergedContext: VantaTraceContext = {
+        ...activeStoreCopy,
+        userId: context?.userId || dynamicUserId || activeStoreCopy.userId,
+        route: context?.route || dynamicRoute || activeStoreCopy.route,
+        ...context,
+        metadata: {
+          ...activeStoreCopy.metadata,
+          ...context?.metadata
+        }
+      };
+
+      // Ensure req reference is removed from serialization scope
+      delete (mergedContext as any).req;
+
       const payload: ErrorPayload = {
         apiKey: this.apiKey,
-        serviceName: this.serviceName,
-        environment: this.environment,
         timestamp: new Date().toISOString(),
+        traceId,
         error: normalized,
-        context: context || {},
+        context: mergedContext,
         system: systemContext,
-        severity: context?.severity
+        severity: mergedContext.severity || 'critical'
       };
 
       if (this.debug) {
-        console.log(`[VantaTrace] Sending error event: ${normalized.name} - ${normalized.message} (Severity: ${payload.severity || 'default'})`);
+        console.log(`[VantaTrace] [${traceId}] Sending error event: ${normalized.name} - ${normalized.message} (Severity: ${payload.severity || 'default'})`);
       }
 
       sendPayload(this.apiUrl, this.apiKey, payload, this.debug);
@@ -85,6 +164,8 @@ export class VantaTrace {
       if (this.debug) {
         console.error(`[VantaTrace] Failed to capture exception internally: ${e.message}`);
       }
+    } finally {
+      this._setCapturing(false);
     }
   }
 
@@ -110,10 +191,12 @@ export class VantaTrace {
   }
 
   /**
-   * Express error handling middleware
+   * Express Request Context middleware.
+   * Mount at the very top of your Express app's middleware stack.
+   * Seeds the AsyncLocalStorage scope with request details.
    */
-  public expressMiddleware() {
-    return (err: any, req: any, res: any, next: any) => {
+  public requestHandler() {
+    return (req: any, res: any, next: any) => {
       let userId = undefined;
       if (req.user && typeof req.user === 'object') {
         userId = req.user.id || req.user._id || req.user.userId;
@@ -121,7 +204,7 @@ export class VantaTrace {
         userId = req.userId;
       }
 
-      // Sanitize request body if password exists
+      // Sanitize request body if sensitive parameters exist
       let sanitizedBody = undefined;
       if (req.body && typeof req.body === 'object') {
         sanitizedBody = { ...req.body };
@@ -145,7 +228,8 @@ export class VantaTrace {
         }
       }
 
-      this.captureException(err, {
+      const activeContext: any = {
+        req, // Keep active request reference to dynamically resolve user/route parameters later
         userId: userId ? String(userId) : undefined,
         route: req.route?.path || req.path || req.url,
         method: req.method,
@@ -155,35 +239,201 @@ export class VantaTrace {
           query: req.query,
           body: sanitizedBody
         }
+      };
+
+      // Wrap route execution scope under AsyncLocalStorage context
+      VantaTrace.asyncLocalStorage.run(activeContext, () => {
+        next();
       });
+    };
+  }
+
+  /**
+   * Express Global Error Handling middleware.
+   * Mount at the very bottom of your Express app's middleware stack.
+   * Intercepts unhandled route exceptions and logs them under the active request scope.
+   */
+  public errorHandler() {
+    return (err: any, req: any, res: any, next: any) => {
+      this.captureException(err);
       next(err);
     };
   }
 
   /**
-   * Automatically catch all uncaught exceptions and unhandled rejections
+   * @deprecated Use requestHandler() at the top and errorHandler() at the bottom.
+   */
+  public expressMiddleware() {
+    return this.errorHandler();
+  }
+
+  /**
+   * Safe monkey-patching of console.error
+   */
+  private _patchConsole(): void {
+    const originalConsoleError = console.error;
+    const self = this;
+
+    console.error = function (...args: any[]) {
+      // Only CHECK the flag — do NOT set it here.
+      // captureException sets/clears it internally. Setting it here would
+      // cause captureException to see the flag and return early, silently
+      // dropping the error.
+      if (!self._isCapturing()) {
+        const error = args.find(arg => arg instanceof Error);
+        if (error) {
+          try {
+            self.captureException(error, {
+              severity: 'critical',
+              metadata: { source: 'Console Error Interception' }
+            });
+          } catch (err) {
+            // Fail-silent
+          }
+        }
+      }
+      originalConsoleError.apply(console, args);
+    };
+  }
+
+  /**
+   * Safe conditional patching of Winston
+   */
+  private _tryPatchWinston(): void {
+    try {
+      const winston = require('winston');
+      if (winston && winston.add) {
+        const transport = createWinstonTransport(this);
+        if (transport) {
+          winston.add(transport);
+          if (this.debug) {
+            console.log('[VantaTrace Debug] Successfully auto-patched Winston logging.');
+          }
+        }
+      }
+    } catch (e) {
+      // Winston is not present. Ignored.
+    }
+  }
+
+  /**
+   * Safe conditional patching of Pino
+   */
+  private _tryPatchPino(): void {
+    try {
+      const pino = require('pino');
+      if (pino && pino.prototype && pino.prototype.write) {
+        const originalWrite = pino.prototype.write;
+        const self = this;
+
+        pino.prototype.write = function (obj: any, msg: string, num: number) {
+          // Only CHECK the flag — captureException manages it internally.
+          if (!self._isCapturing()) {
+            let err: any = null;
+            if (obj && obj instanceof Error) {
+              err = obj;
+            } else if (obj && obj.err && obj.err instanceof Error) {
+              err = obj.err;
+            } else if (obj && obj.error && obj.error instanceof Error) {
+              err = obj.error;
+            }
+            if (err) {
+              try {
+                self.captureException(err, {
+                  severity: 'critical',
+                  metadata: { source: 'Pino Logger Interception' }
+                });
+              } catch (e) {
+                // Fail-silent
+              }
+            }
+          }
+          return originalWrite.call(this, obj, msg, num);
+        };
+
+        if (this.debug) {
+          console.log('[VantaTrace Debug] Successfully auto-patched Pino logging.');
+        }
+      }
+    } catch (e) {
+      // Pino is not present. Ignored.
+    }
+  }
+
+  /**
+   * Centralized handler for all globally intercepted errors.
+   *
+   * Provides:
+   * - Deduplication via reportedErrors WeakSet (errors reaching multiple handlers are sent once)
+   * - ALS context extraction (request metadata survives even for catch-block re-throws)
+   * - Strategy tagging (captureStrategy tells the dashboard HOW the error was caught)
+   * - Cause chain correlation (dashboard links the secondary error to the original)
+   * - Self-defense (SDK never crashes the host application)
+   */
+  private _handleCentralizedError(
+    error: Error,
+    strategyType: 'uncaughtException' | 'unhandledRejection' | 'consoleError' | 'winstonInterception' | 'pinoInterception'
+  ): void {
+    // Deduplication: errors may reach multiple handlers (e.g. console.error + uncaughtException)
+    if (this.reportedErrors.has(error)) return;
+
+    try {
+      // Pull any surviving ALS context (route, userId, metadata) from the request that triggered the catch block
+      const activeStore = VantaTrace.asyncLocalStorage.getStore() as any || {};
+
+      this.captureException(error, {
+        severity: 'critical',
+        metadata: {
+          ...activeStore.metadata,
+          captureStrategy: strategyType,
+          thrownFromCatchBlock: true,
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (_internalErr) {
+      // SDK self-defense: never crash the user's host app
+    }
+  }
+
+  /**
+   * Automatically catch all uncaught exceptions, unhandled rejections, and logger errors.
+   *
+   * This is the centralized safety net that intercepts:
+   * 1. Synchronous uncaught exceptions (typos / runtime errors inside catch blocks)
+   * 2. Unhandled async/await rejections (re-thrown errors inside async catch blocks)
+   * 3. Errors flowing through monkey-patched loggers (console.error, Winston, Pino)
    */
   public initGlobalHandlers(): void {
+    // ── Capture System 1: Synchronous Uncaught Exceptions ──
+    // Catches native/runtime errors that escape catch blocks (e.g. typos, undefined refs)
     process.on('uncaughtException', (err) => {
       if (this.debug) {
         console.log('[VantaTrace] Captured uncaught exception globally');
       }
-      this.captureException(err);
+      this._handleCentralizedError(err, 'uncaughtException');
 
-      // Let the exception bubble up to avoid inconsistent process state (standard practice)
-      // but give a short time window for the async request to finish sending.
+      // Allow time for the batched transport (setImmediate + DNS + TLS + 2s timeout)
+      // to complete before the process dies.
       setTimeout(() => {
         process.exit(1);
-      }, 500);
+      }, 1500);
     });
 
+    // ── Capture System 2: Async/Await Catch-Block Re-throws ──
+    // In modern Node.js, errors explicitly thrown or generated inside async catch blocks
+    // surface as unhandled rejections. This captures them at the process root.
     process.on('unhandledRejection', (reason) => {
       if (this.debug) {
         console.log('[VantaTrace] Captured unhandled promise rejection globally');
       }
       const err = reason instanceof Error ? reason : new Error(String(reason));
-      this.captureException(err);
+      this._handleCentralizedError(err, 'unhandledRejection');
     });
+
+    // ── Capture System 3: Logger Monkey-Patch Interceptors ──
+    this._patchConsole();
+    this._tryPatchWinston();
+    this._tryPatchPino();
   }
 }
 export default VantaTrace;
