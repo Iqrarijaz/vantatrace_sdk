@@ -5,6 +5,7 @@ import { normalizeError } from './normalizer';
 import { getSystemContext, startTelemetrySampling } from './context';
 import { sendPayload } from './transport';
 import { createWinstonTransport } from './winston';
+import { registerGlobalInstance } from './registry';
 
 export class VantaTrace {
   private apiKey: string;
@@ -55,6 +56,8 @@ export class VantaTrace {
 
     // Start background system telemetry sampler (runs every 10 seconds, unrefed)
     startTelemetrySampling(10000);
+
+    registerGlobalInstance(this, this.debug);
   }
 
   /**
