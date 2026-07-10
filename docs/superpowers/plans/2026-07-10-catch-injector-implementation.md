@@ -519,15 +519,23 @@ const IGNORE_DIRECTIVE = 'vantatrace-ignore';
 function isIgnored(path, state) {
   const tryStatementNode = path.parentPath.node;
   const bodyStatements = path.node.body.body;
-  const searchStart = tryStatementNode.start;
   const searchEnd = bodyStatements.length > 0 ? bodyStatements[0].start : path.node.body.end;
   const comments = (state.file && state.file.ast && state.file.ast.comments) || [];
-  return comments.some(
+
+  // Comments inline after `catch (err) {` or as the first line inside the block.
+  const hasIgnoreInRange = comments.some(
     (comment) =>
       comment.value.includes(IGNORE_DIRECTIVE) &&
-      comment.start >= searchStart &&
+      comment.start >= tryStatementNode.start &&
       comment.end <= searchEnd
   );
+  if (hasIgnoreInRange) return true;
+
+  // Comments directly above `try` fall outside that range (they precede
+  // tryStatementNode.start) — Babel attaches these as the TryStatement's own
+  // leadingComments, so check that separately.
+  const leadingComments = tryStatementNode.leadingComments || [];
+  return leadingComments.some((comment) => comment.value.includes(IGNORE_DIRECTIVE));
 }
 
 // Detects a pre-existing `x.captureException(...)` or bare `captureExceptionGlobal(...)`
