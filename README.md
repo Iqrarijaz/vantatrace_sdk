@@ -131,9 +131,19 @@ your entrypoint (see step 1) automatically.
 
 ```json
 {
+  "presets": ["@babel/preset-env"],
   "plugins": ["@vantatrace/sdk/babel-plugin"]
 }
 ```
+
+> [!NOTE]
+> The plugin auto-imports its runtime helper as an ESM `import` or a CommonJS
+> `require()` depending on Babel's detected `sourceType` for each file. A module
+> transform like `@babel/preset-env` (or setting `sourceType: "unambiguous"`) makes
+> sure that import is correctly compiled down for CommonJS codebases — without one,
+> a plain CommonJS file with no `import`/`export` syntax will otherwise get an ESM
+> `import` injected into it and fail at runtime with `SyntaxError: Cannot use import
+> statement outside a module`.
 
 **Next.js (`next.config.js`):**
 
