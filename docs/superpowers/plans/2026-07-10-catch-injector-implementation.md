@@ -16,6 +16,7 @@
 - No linter is configured in this repo — do not add one as part of this work.
 - Do not change the documented `new VantaTrace(options)` Quick Start API in `README.md` section 1.
 - The ignore directive string is exactly `vantatrace-ignore` (matches existing README wording) — do not rename it.
+- **`npm test` runs an explicit, space-separated file list — not a glob, not bare auto-discovery.** Verified during Task 1: `npm` on this Windows setup runs scripts via `cmd.exe`, which does not expand globs, and Node's built-in test runner does not match `.test.ts` files during its own auto-discovery (only `.js`/`.mjs`/`.cjs`). Every task that adds a new test file MUST append that file's path to the `"test"` script in `package.json` in the same commit, e.g. `"tsx --test src/registry.test.ts src/runtime.test.ts"`. Task 2 adds `src/runtime.test.ts`, Task 3 adds `src/index.test.ts`, Task 4 adds `babel-plugin.test.js` — each of those tasks' steps below must include this `package.json` edit even where not spelled out verbatim.
 
 ---
 
