@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import { NormalizedCause } from './types';
 
 export function getFingerprint(name: string, message: string, stack: string): string {
   const hash = crypto.createHash('md5');
@@ -12,6 +13,57 @@ export function getFingerprint(name: string, message: string, stack: string): st
   return hash.digest('hex');
 }
 
+/**
+ * Walk the native `Error.cause` chain (ES2022+) and return a normalized array.
+ * Capped at MAX_CAUSE_DEPTH to prevent infinite loops from circular references.
+ */
+const MAX_CAUSE_DEPTH = 5;
+
+function extractCauseChain(err: any): NormalizedCause[] | undefined {
+  if (!err || typeof err !== 'object' || !err.cause) return undefined;
+
+  const chain: NormalizedCause[] = [];
+  const seen = new WeakSet();
+  let current = err.cause;
+
+  while (current && chain.length < MAX_CAUSE_DEPTH) {
+    // Guard against circular cause references
+    if (typeof current === 'object' && seen.has(current)) break;
+    if (typeof current === 'object') seen.add(current);
+
+    if (current instanceof Error) {
+      chain.push({
+        name: current.name || 'Error',
+        message: current.message || 'Unknown error',
+        stack: current.stack || '',
+        code: 'code' in current ? String((current as any).code) : undefined,
+        statusCode: 'statusCode' in current ? Number((current as any).statusCode) :
+                     'status' in current ? Number((current as any).status) : undefined
+      });
+      current = (current as any).cause;
+    } else if (typeof current === 'object' && current.message) {
+      chain.push({
+        name: current.name || 'Error',
+        message: String(current.message),
+        stack: current.stack || '',
+        code: current.code ? String(current.code) : undefined,
+        statusCode: current.statusCode ? Number(current.statusCode) : undefined
+      });
+      current = current.cause;
+    } else {
+      // Primitive cause (string, number, etc.) — record it and stop
+      chain.push({
+        name: 'Error',
+        message: String(current),
+        stack: ''
+      });
+      break;
+    }
+  }
+
+  return chain.length > 0 ? chain : undefined;
+}
+
 export function normalizeError(err: any): {
   name: string;
   message: string;
@@ -20,6 +72,7 @@ export function normalizeError(err: any): {
   code?: string;
   statusCode?: number;
   extra?: Record<string, any>;
+  cause?: NormalizedCause[];
 } {
   let name = 'Error';
   let message = 'Unknown error';
@@ -37,7 +90,7 @@ export function normalizeError(err: any): {
     if ('status' in err) statusCode = Number((err as any).status);
     if ('statusCode' in err) statusCode = Number((err as any).statusCode);
 
-    const extraKeys = Object.keys(err).filter(k => !['name', 'message', 'stack', 'code', 'status', 'statusCode'].includes(k));
+    const extraKeys = Object.keys(err).filter(k => !['name', 'message', 'stack', 'code', 'status', 'statusCode', 'cause'].includes(k));
     if (extraKeys.length > 0) {
       extra = {};
       for (const key of extraKeys) {
@@ -56,7 +109,7 @@ export function normalizeError(err: any): {
     if ('status' in err) statusCode = Number(err.status);
     if ('statusCode' in err) statusCode = Number(err.statusCode);
 
-    const extraKeys = Object.keys(err).filter(k => !['name', 'message', 'stack', 'code', 'status', 'statusCode'].includes(k));
+    const extraKeys = Object.keys(err).filter(k => !['name', 'message', 'stack', 'code', 'status', 'statusCode', 'cause'].includes(k));
     if (extraKeys.length > 0) {
       extra = {};
       for (const key of extraKeys) {
@@ -69,6 +122,7 @@ export function normalizeError(err: any): {
   }
 
   const fingerprint = getFingerprint(name, message, stack);
+  const cause = extractCauseChain(err);
 
-  return { name, message, stack, fingerprint, code, statusCode, extra };
+  return { name, message, stack, fingerprint, code, statusCode, extra, cause };
 }

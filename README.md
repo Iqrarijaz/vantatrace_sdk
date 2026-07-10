@@ -36,7 +36,7 @@ npm install @vantatrace/sdk
 
 ## ⚡ Quick Start
 
-First, sign up and get your API keys from [https://api.vantatrace.com](https://api.vantatrace.com) to get started.
+First, sign up and get your API keys from [https://vantatrace.com](https://vantatrace.com) to get started.
 
 ### 1. Initialize SDK
 
@@ -44,9 +44,7 @@ First, sign up and get your API keys from [https://api.vantatrace.com](https://a
 import { VantaTrace } from '@vantatrace/sdk';
 
 const vantaTrace = new VantaTrace({
-  apiKey: 'YOUR_PROJECT_API_KEY', // Get your API Key from https://api.vantatrace.com (starts with ep_live_ or ep_test_)
-  serviceName: 'order-service',
-  // Note: environment is automatically determined from your API key prefix (ep_live_ -> live, ep_test_ -> test)
+  apiKey: 'YOUR_PROJECT_API_KEY', // Get your API Key from https://vantatrace.com (starts with ep_live_ or ep_test_)
   debug: false
 });
 ```
@@ -63,21 +61,40 @@ vantaTrace.initGlobalHandlers();
 
 ### 3. Express Middleware Integration
 
+VantaTrace uses a decoupled two-part middleware design for Express to ensure complete request context tracking without leaking scopes:
+
+1. **`requestHandler()`**: Mounted at the very top of your middleware stack (before any routes or body parsers) to establish the `AsyncLocalStorage` request context.
+2. **`errorHandler()`**: Mounted at the very bottom of your middleware stack (after all routes and controllers) to capture unhandled exceptions under the correct request context.
+
 ``` javascript
 import express from 'express';
+import { VantaTrace } from '@vantatrace/sdk';
 
+const vantaTrace = new VantaTrace({ apiKey: 'YOUR_API_KEY' });
 const app = express();
 
-app.get('/checkout', () => {
+// 1. Mount requestHandler at the very top of the application stack
+app.use(vantaTrace.requestHandler());
+
+// Body parsers, CORS, and other middlewares
+app.use(express.json());
+
+// Routes
+app.get('/checkout', (req, res) => {
   throw new Error('Payment gateway timeout');
 });
 
-app.use(vantaTrace.expressMiddleware());
+// 2. Mount errorHandler at the bottom, before custom error responders
+app.use(vantaTrace.errorHandler());
 
+// Custom fallback error responder
 app.use((err, req, res, next) => {
   res.status(500).send('Internal Server Error');
 });
 ```
+
+> [!NOTE]
+> `vantaTrace.expressMiddleware()` is deprecated but preserved as an alias to `errorHandler()` for backward compatibility.
 
 ------------------------------------------------------------------------
 
@@ -99,6 +116,42 @@ try {
   });
 }
 ```
+
+------------------------------------------------------------------------
+
+### 5. Zero-Code Auto-Capture (Babel Plugin)
+
+VantaTrace includes a built-in Babel plugin that automatically injects `vantaTrace.captureException` into every `try/catch` block in your codebase during build time. This ensures 100% coverage without writing manual capture calls.
+
+**Setup in `.babelrc` or `babel.config.js`:**
+
+```json
+{
+  "plugins": ["@vantatrace/sdk/babel-plugin"]
+}
+```
+
+**How it works:**
+It transforms this:
+```javascript
+try {
+  doSomething();
+} catch (error) {
+  res.status(500).json({ error: 'Failed' });
+}
+```
+
+Into this:
+```javascript
+try {
+  doSomething();
+} catch (error) {
+  vantaTrace.captureException(error);
+  res.status(500).json({ error: 'Failed' });
+}
+```
+
+> **Note:** To ignore a specific catch block (e.g., for expected control flow), add a `// vantatrace-ignore` comment inside or above the `catch` block.
 
 ------------------------------------------------------------------------
 
