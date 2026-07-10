@@ -121,7 +121,11 @@ try {
 
 ### 5. Zero-Code Auto-Capture (Babel Plugin)
 
-VantaTrace includes a built-in Babel plugin that automatically injects `vantaTrace.captureException` into every `try/catch` block in your codebase during build time. This ensures 100% coverage without writing manual capture calls.
+VantaTrace includes a Babel plugin that automatically injects an error capture
+call into every `try/catch` block in your codebase at build time — no manual
+`vantaTrace.captureException()` calls required, and no per-file imports to
+remember. It resolves to whichever `VantaTrace` instance you constructed in
+your entrypoint (see step 1) automatically.
 
 **Setup in `.babelrc` or `babel.config.js`:**
 
@@ -131,7 +135,24 @@ VantaTrace includes a built-in Babel plugin that automatically injects `vantaTra
 }
 ```
 
+**Next.js (`next.config.js`):**
+
+```js
+module.exports = {
+  babel(config) {
+    config.plugins = config.plugins || [];
+    config.plugins.push('@vantatrace/sdk/babel-plugin');
+    return config;
+  }
+};
+```
+
+Next.js defaults to its SWC compiler, but auto-detects a `.babelrc`/`babel.config.js`
+in your project root and switches that project to the Babel pipeline — no extra
+flags needed.
+
 **How it works:**
+
 It transforms this:
 ```javascript
 try {
@@ -143,15 +164,33 @@ try {
 
 Into this:
 ```javascript
+import { captureExceptionGlobal } from '@vantatrace/sdk/runtime';
+// ...
 try {
   doSomething();
 } catch (error) {
-  vantaTrace.captureException(error);
+  captureExceptionGlobal(error);
   res.status(500).json({ error: 'Failed' });
 }
 ```
 
-> **Note:** To ignore a specific catch block (e.g., for expected control flow), add a `// vantatrace-ignore` comment inside or above the `catch` block.
+(In CommonJS files, it injects an equivalent `require('@vantatrace/sdk/runtime')`
+instead of an `import`.)
+
+**Skip rules — the plugin will NOT inject a capture call when:**
+- The catch block has no binding: `catch { ... }`.
+- The catch binding is destructured: `catch ({ message }) { ... }`.
+- `captureException`/`captureExceptionGlobal` is already called manually within
+  that same catch block.
+- A `// vantatrace-ignore` comment appears above the `try`, above the `catch`,
+  or inline on the `catch (err) {` line:
+  ```javascript
+  try {
+    doSomething();
+  } catch (error) { // vantatrace-ignore
+    // expected control flow — not an error worth reporting
+  }
+  ```
 
 ------------------------------------------------------------------------
 
