@@ -1,0 +1,1 @@
+export { captureExceptionGlobal } from './registry';
