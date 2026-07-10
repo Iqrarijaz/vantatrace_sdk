@@ -6,7 +6,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/index.test.ts",
+    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/index.test.ts babel-plugin.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -31,8 +31,12 @@
     "url": "git+https://github.com/Iqrarijaz/vantatrace_sdk.git"
   },
   "devDependencies": {
+    "@babel/core": "^7.29.7",
     "@types/node": "^20.11.0",
     "tsx": "^4.23.0",
     "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@babel/helper-module-imports": "^7.29.7"
   }
 }
