@@ -5,11 +5,13 @@ const IMPORTED_FUNCTION_NAME = 'captureExceptionGlobal';
 const IGNORE_DIRECTIVE = 'vantatrace-ignore';
 
 function isIgnored(path, state) {
-  const tryStatementNode = path.parentPath.node;
+  const tryStatementPath = path.parentPath;
+  const tryStatementNode = tryStatementPath.node;
   const bodyStatements = path.node.body.body;
   const searchEnd = bodyStatements.length > 0 ? bodyStatements[0].start : path.node.body.end;
   const comments = (state.file && state.file.ast && state.file.ast.comments) || [];
 
+  // Comments inline after `catch (err) {` or as the first line inside the block.
   const hasIgnoreInRange = comments.some(
     (comment) =>
       comment.value.includes(IGNORE_DIRECTIVE) &&
@@ -18,8 +20,34 @@ function isIgnored(path, state) {
   );
   if (hasIgnoreInRange) return true;
 
-  const leadingComments = tryStatementNode.leadingComments || [];
-  return leadingComments.some((comment) => comment.value.includes(IGNORE_DIRECTIVE));
+  // A comment on its own line directly above `try`. Bounded below by the end
+  // of the previous sibling statement (or the enclosing block's start, if
+  // `try` is the first statement) so a trailing comment sharing a line with
+  // the previous statement is never mistaken for a deliberate ignore
+  // directive placed above `try`. Siblings synthetically inserted by this
+  // plugin (e.g. a `captureExceptionGlobal(...)` call unshifted into an
+  // enclosing catch block that was visited first) have no source position,
+  // so they are skipped in favor of the nearest real, positioned sibling.
+  let previousSibling = null;
+  if (typeof tryStatementPath.key === 'number') {
+    for (let i = tryStatementPath.key - 1; i >= 0; i--) {
+      const candidate = tryStatementPath.getSibling(i).node;
+      if (candidate && typeof candidate.start === 'number') {
+        previousSibling = candidate;
+        break;
+      }
+    }
+  }
+  const windowStart = previousSibling ? previousSibling.end : tryStatementPath.parentPath.node.start;
+  const previousSiblingEndLine = previousSibling ? previousSibling.loc.end.line : -1;
+
+  return comments.some(
+    (comment) =>
+      comment.value.includes(IGNORE_DIRECTIVE) &&
+      comment.start >= windowStart &&
+      comment.end <= tryStatementNode.start &&
+      comment.loc.start.line > previousSiblingEndLine
+  );
 }
 
 // Detects a pre-existing `x.captureException(...)` or bare `captureExceptionGlobal(...)`

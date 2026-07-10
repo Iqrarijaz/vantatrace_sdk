@@ -92,6 +92,19 @@ test('skips when // vantatrace-ignore precedes the try statement', () => {
   assert.doesNotMatch(output, /captureExceptionGlobal/);
 });
 
+test('does not treat an unrelated trailing comment on the previous statement as an ignore directive', () => {
+  const input = [
+    'logSomething(); // TODO: remove the vantatrace-ignore workaround later',
+    'try {',
+    '  a();',
+    '} catch (err) {',
+    '  b(err);',
+    '}'
+  ].join('\n');
+  const output = run(input, 'script');
+  assert.match(output, /captureExceptionGlobal/);
+});
+
 test('skips when // vantatrace-ignore is inline after the catch clause', () => {
   const input = [
     'try {',
