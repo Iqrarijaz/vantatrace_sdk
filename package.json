@@ -1,6 +1,6 @@
 {
   "name": "@vantatrace/sdk",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "Drop-in observability SDK for Node.js microservices powering error tracking, structured logging, and real-time telemetry pipelines.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,7 +21,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/index.test.ts babel-plugin.test.js",
+    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/caught-exceptions.test.ts src/index.test.ts babel-plugin.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

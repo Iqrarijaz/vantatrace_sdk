@@ -45,6 +45,7 @@ import { VantaTrace } from '@vantatrace/sdk';
 
 const vantaTrace = new VantaTrace({
   apiKey: 'YOUR_PROJECT_API_KEY', // Get your API Key from https://vantatrace.com (starts with ep_live_ or ep_test_)
+  serviceName: 'checkout-service', // optional — labels events on the dashboard (defaults to your project name)
   debug: false
 });
 ```
@@ -98,7 +99,98 @@ app.use((err, req, res, next) => {
 
 ------------------------------------------------------------------------
 
-### 4. Manual Error Capturing
+### 4. Automatic Capture of Errors Handled in try/catch (Runtime)
+
+Errors handled inside a local `try/catch` never reach the error middleware:
+
+``` javascript
+app.get('/api/v1/check', (req, res) => {
+  try {
+    a; // ReferenceError
+  } catch (error) {
+    res.status(500).json({ error: 'Order failed' }); // silently lost?
+  }
+});
+```
+
+VantaTrace captures these automatically — no `captureException()` call and no
+per-catch-block changes required — through two layers:
+
+#### 4a. Failed-request safety net (enabled by default)
+
+When a request finishes with a **5xx status** and no error was reported for it,
+the SDK emits a synthetic `HttpServerError` event carrying the method, route,
+status code, and full request context (`metadata.captureStrategy: 'http5xx'`).
+The failure becomes visible on the dashboard even though the original error
+object was swallowed. Disable with:
+
+``` javascript
+new VantaTrace({ apiKey, autoCapture: { http5xx: false } });
+```
+
+#### 4b. Deep capture via the V8 inspector (opt-in)
+
+JavaScript has no language-level hook for caught exceptions — `try/catch` is
+resolved entirely inside the V8 VM (this is why Sentry and Bugsnag require
+manual capture calls for handled errors). The one runtime mechanism that can
+observe them is the V8 inspector protocol: with pause-on-exceptions enabled,
+V8 notifies an in-process `node:inspector` session at **every throw site,
+before the catch block runs** — including engine-generated errors like
+`ReferenceError` and `TypeError`. VantaTrace uses this to recover the *real*
+error object with its full stack trace and request context:
+
+``` javascript
+const vantaTrace = new VantaTrace({
+  apiKey: 'YOUR_API_KEY',
+  autoCapture: {
+    caughtExceptions: true
+  }
+});
+```
+
+With this enabled, the `/api/v1/check` example above reports the actual
+`ReferenceError: a is not defined` — with the stack pointing at your route
+code — automatically.
+
+**Reporting policy.** Caught exceptions are often successfully handled, so by
+default the SDK buffers them per request and reports only when the request
+actually fails:
+
+``` javascript
+autoCapture: {
+  caughtExceptions: {
+    report: 'request-failure', // default: report only if the request ends >= 500
+    // report: 'always',       // report every caught exception immediately (severity: warning)
+    includeNodeModules: false, // ignore throws originating inside node_modules (default)
+    maxPerMinute: 120          // recording ceiling to protect throw-heavy hot paths
+  }
+}
+```
+
+- `'request-failure'` (default): errors your code recovered from (response
+  < 500) are never reported — zero noise. If the request ends 5xx, the first
+  caught exception is reported as the root cause with any later ones
+  summarized in `metadata.additionalCaughtErrors`.
+- `'always'`: also captures caught exceptions outside HTTP requests (queue
+  consumers, cron jobs).
+
+Duplicates are automatically suppressed: an error that is caught, rethrown,
+and then reaches `errorHandler()` (or a manual `captureException`) is reported
+exactly once.
+
+**Performance.** Near-zero overhead while nothing throws; roughly **0.3–0.5ms
+per thrown exception** while enabled (measured on Node 22). That is negligible
+when exceptions are exceptional, but measurable for code that uses throw/catch
+as control flow — which is why this layer is opt-in, the same trade-off Sentry
+documents for its `captureAllExceptions` local-variables mode. For
+zero-runtime-overhead capture, use the Babel plugin (next section) instead.
+
+Call `vantaTrace.shutdown()` on graceful shutdown to detach the inspector
+session (optional; safe to call multiple times).
+
+------------------------------------------------------------------------
+
+### 5. Manual Error Capturing
 
 ``` javascript
 try {
@@ -119,7 +211,7 @@ try {
 
 ------------------------------------------------------------------------
 
-### 5. Zero-Code Auto-Capture (Babel Plugin)
+### 6. Zero-Code Auto-Capture (Babel Plugin)
 
 VantaTrace includes a Babel plugin that automatically injects an error capture
 call into every `try/catch` block in your codebase at build time — no manual
