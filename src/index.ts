@@ -6,11 +6,20 @@ import { getSystemContext, startTelemetrySampling } from './context';
 import { sendPayload } from './transport';
 import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
+import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-exceptions';
+
+/** Cap on caught exceptions buffered per request while waiting for the response outcome. */
+const MAX_BUFFERED_CAUGHT_ERRORS = 20;
 
 export class VantaTrace {
   private apiKey: string;
   private debug: boolean;
   private apiUrl: string;
+  private serviceName?: string;
+  // Auto-capture configuration (resolved from options.autoCapture)
+  private http5xxEnabled: boolean;
+  private caughtReportPolicy: 'request-failure' | 'always';
+  private stopCaughtWatcher: (() => void) | null = null;
 
   // native AsyncLocalStorage store to capture request context
   private static asyncLocalStorage = new AsyncLocalStorage<VantaTraceContext>();
@@ -42,12 +51,31 @@ export class VantaTrace {
   constructor(options: VantaTraceOptions) {
     this.apiKey = options.apiKey || '';
     this.debug = !!options.debug;
+    this.serviceName = options.serviceName;
 
     // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
 
     if (!options.apiKey && this.debug) {
       console.warn('[VantaTrace] WARNING: API key is missing. SDK will run in dry-run mode.');
+    }
+
+    // Resolve auto-capture configuration
+    const autoCapture = options.autoCapture || {};
+    this.http5xxEnabled = autoCapture.http5xx !== false;
+    const caughtOpts = autoCapture.caughtExceptions;
+    const caughtConfig = typeof caughtOpts === 'object' && caughtOpts !== null ? caughtOpts : {};
+    this.caughtReportPolicy = caughtConfig.report || 'request-failure';
+
+    if (caughtOpts) {
+      this.stopCaughtWatcher = startCaughtExceptionWatcher(
+        (error, info) => this._recordCaughtException(error, info),
+        {
+          includeNodeModules: !!caughtConfig.includeNodeModules,
+          maxPerMinute: caughtConfig.maxPerMinute || 120,
+          debug: this.debug
+        }
+      );
     }
 
     if (this.debug) {
@@ -58,6 +86,17 @@ export class VantaTrace {
     startTelemetrySampling(10000);
 
     registerGlobalInstance(this, this.debug);
+  }
+
+  /**
+   * Stop background instrumentation (the V8 inspector watcher). Useful for
+   * graceful shutdown and test teardown; safe to call multiple times.
+   */
+  public shutdown(): void {
+    if (this.stopCaughtWatcher) {
+      this.stopCaughtWatcher();
+      this.stopCaughtWatcher = null;
+    }
   }
 
   /**
@@ -82,6 +121,11 @@ export class VantaTrace {
    */
   public captureException(error: any, context?: VantaTraceContext): void {
     if (this._isCapturing()) return;
+
+    // Mark the active request as "an error was reported" so the auto-capture
+    // finalizer doesn't emit a duplicate/synthetic event for the same request.
+    const requestStore = VantaTrace.asyncLocalStorage.getStore() as any;
+    if (requestStore) requestStore._vantaErrorCaptured = true;
 
     try {
       if (!this.apiKey) {
@@ -142,11 +186,15 @@ export class VantaTrace {
         }
       };
 
-      // Ensure req reference is removed from serialization scope
+      // Ensure req reference and SDK-internal bookkeeping are removed from serialization scope
       delete (mergedContext as any).req;
+      delete (mergedContext as any)._vantaCapturing;
+      delete (mergedContext as any)._vantaErrorCaptured;
+      delete (mergedContext as any)._vantaCaughtErrors;
 
       const payload: ErrorPayload = {
         apiKey: this.apiKey,
+        serviceName: this.serviceName,
         timestamp: new Date().toISOString(),
         traceId,
         error: normalized,
@@ -241,11 +289,113 @@ export class VantaTrace {
         }
       };
 
+      // Auto-capture: once the response has been sent, report swallowed errors
+      // for requests that failed with a 5xx status. 'finish' fires per response
+      // and the listener holds only this request's context object.
+      if (res && typeof res.on === 'function') {
+        res.on('finish', () => this._onRequestFinished(activeContext, req, res));
+      }
+
       // Wrap route execution scope under AsyncLocalStorage context
       VantaTrace.asyncLocalStorage.run(activeContext, () => {
         next();
       });
     };
+  }
+
+  /**
+   * Records an exception observed at its throw site by the V8 inspector watcher
+   * (see caught-exceptions.ts). Runs synchronously inside the throwing async
+   * context, so the request's AsyncLocalStorage store is still active.
+   */
+  private _recordCaughtException(error: any, info: CaughtExceptionInfo): void {
+    // Ignore exceptions raised by the SDK's own capture pipeline.
+    if (this._isCapturing()) return;
+
+    // Exceptions V8 predicts will escape every handler are already covered by
+    // errorHandler()/uncaughtException with richer semantics — skip them here.
+    if (info.uncaught) return;
+
+    if (this.caughtReportPolicy === 'always') {
+      this.captureException(error, {
+        severity: 'warning',
+        metadata: {
+          captureStrategy: 'caughtException',
+          handled: true,
+          throwSite: info.frameUrl || undefined
+        }
+      });
+      return;
+    }
+
+    // 'request-failure' policy: buffer on the active request and let the
+    // response outcome decide (see _onRequestFinished). Outside a request
+    // scope there is no outcome to correlate with, so the error is dropped.
+    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    if (!store) return;
+    if (!store._vantaCaughtErrors) store._vantaCaughtErrors = [];
+    if (store._vantaCaughtErrors.length < MAX_BUFFERED_CAUGHT_ERRORS) {
+      store._vantaCaughtErrors.push(error);
+    }
+  }
+
+  /**
+   * Response finalizer for auto-capture. When a request ends with a 5xx status
+   * and no exception was reported for it, this reports the real caught
+   * exception (when the inspector watcher recorded one) or a synthetic
+   * HttpServerError so the failure is at least visible on the dashboard.
+   */
+  private _onRequestFinished(store: any, req: any, res: any): void {
+    try {
+      const status = res?.statusCode;
+      if (!status || status < 500) return;
+      if (store._vantaErrorCaptured) return;
+
+      // Re-enter the request's async context: 'finish' may be emitted from the
+      // socket's context, and captureException reads ALS for enrichment.
+      const capture = (error: any, context: VantaTraceContext) => {
+        VantaTrace.asyncLocalStorage.run(store, () => this.captureException(error, context));
+      };
+
+      const caughtErrors: any[] = store._vantaCaughtErrors || [];
+      if (caughtErrors.length > 0) {
+        // The first caught exception is the root cause; later ones are usually
+        // cascade failures. Summarize the rest instead of sending N events.
+        const [primary, ...rest] = caughtErrors;
+        capture(primary, {
+          severity: 'critical',
+          metadata: {
+            captureStrategy: 'caughtException',
+            handled: true,
+            httpStatusCode: status,
+            ...(rest.length > 0
+              ? { additionalCaughtErrors: rest.map(e => `${e?.name || 'Error'}: ${e?.message || String(e)}`) }
+              : {})
+          }
+        });
+        return;
+      }
+
+      if (!this.http5xxEnabled) return;
+
+      const method = req?.method || store.method || 'UNKNOWN';
+      const route = store.route || req?.originalUrl || req?.url || 'unknown route';
+      const synthetic = new Error(
+        `${method} ${route} responded with HTTP ${status} but no exception was reported ` +
+        `(likely swallowed by a try/catch block)`
+      );
+      synthetic.name = 'HttpServerError';
+      capture(synthetic, {
+        severity: 'critical',
+        metadata: {
+          captureStrategy: 'http5xx',
+          handled: true,
+          httpStatusCode: status
+        }
+      });
+    } catch (_e) {
+      // Never interfere with the response lifecycle.
+    }
   }
 
   /**
