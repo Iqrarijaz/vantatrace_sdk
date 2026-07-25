@@ -2,6 +2,10 @@ export interface VantaTraceOptions {
   apiKey: string;
   debug?: boolean;
   apiUrl?: string;
+  /** Extra key names (case-insensitive substring match) to redact from request bodies, query params, and error `extra`/metadata payloads, in addition to the SDK's built-in list (password, token, secret, cookie, ssn, credit card, etc.). */
+  sensitiveKeys?: string[];
+  /** Extra regexes to redact from free-text values (error messages/stacks, query strings) in addition to the SDK's built-in patterns (password=/token= pairs, Bearer tokens, JWTs, SSNs, credit-card-like digit runs, emails). Use the `g` flag to replace every match. */
+  sensitivePatterns?: RegExp[];
 }
 
 export interface VantaTraceContext {

@@ -223,8 +223,30 @@ Async Queue → Ingestion API → Dashboard
 
 ## 🔒 Security
 
-Sensitive fields are automatically redacted: password, token,
-authorization, cookie, x-api-key
+PII and secrets are redacted recursively, everywhere the SDK captures data
+— not just top-level fields:
+
+-   **Headers**: `authorization`, `cookie`, `set-cookie`, `x-api-key`,
+    `proxy-authorization`
+-   **Request bodies & query params**: any nested field named like
+    `password`, `token`, `secret`, `apiKey`, `authorization`, `cookie`,
+    `session`, `ssn`, `creditCard`/`cardNumber`, `cvv`/`cvc`, `pin`,
+    `privateKey`, `clientSecret` (case-insensitive, at any depth, including
+    inside arrays)
+-   **Error messages, stacks, and route strings**: scanned for
+    secret-shaped substrings even outside a matching key — `key=value`
+    pairs, `Bearer <token>`, JWTs, SSNs, credit-card-like digit runs, and
+    email addresses are redacted in place
+
+Add your own rules at `init()` without losing the defaults:
+
+```js
+const vantaTrace = new VantaTrace({
+  apiKey: 'your-api-key',
+  sensitiveKeys: ['internalAuditId', 'accountNumber'],
+  sensitivePatterns: [/ACME-\d+/g]
+});
+```
 
 ------------------------------------------------------------------------
 

@@ -21,7 +21,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/index.test.ts babel-plugin.test.js",
+    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/index.test.ts src/scrub.test.ts src/scrub-integration.test.ts babel-plugin.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
