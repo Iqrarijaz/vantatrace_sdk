@@ -71,6 +71,13 @@ export class VantaTrace {
     this.caughtReportPolicy = caughtConfig.report || 'request-failure';
 
     if (caughtOpts) {
+      if (process.env.NODE_ENV === 'production') {
+        console.warn(
+          '[VantaTrace] WARNING: Runtime caught-exception capture (V8 inspector watcher) is enabled in production. ' +
+          'This is a high-risk operational choice that can block the event loop and cause latency spikes. ' +
+          'Consider using compile-time AST instrumentation (@vantatrace/babel-plugin) instead.'
+        );
+      }
       this.stopCaughtWatcher = startCaughtExceptionWatcher(
         (error, info) => this._recordCaughtException(error, info),
         {
