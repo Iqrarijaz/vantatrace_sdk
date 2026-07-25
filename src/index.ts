@@ -1,12 +1,13 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import * as crypto from 'crypto';
-import { VantaTraceOptions, VantaTraceContext, ErrorPayload } from './types';
+import { VantaTraceOptions, VantaTraceContext, ErrorPayload, Breadcrumb } from './types';
 import { normalizeError } from './normalizer';
 import { getSystemContext, startTelemetrySampling } from './context';
 import { sendPayload } from './transport';
 import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
 import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-exceptions';
+
 
 /** Cap on caught exceptions buffered per request while waiting for the response outcome. */
 const MAX_BUFFERED_CAUGHT_ERRORS = 20;
@@ -30,6 +31,8 @@ export class VantaTrace {
   // Per-context via ALS when inside a request scope; global fallback for
   // uncaughtException / console.error calls outside any request.
   private _globalReentranceGuard = false;
+  private _consoleGuard = false;
+
 
   /** Check if an error capture is already in progress for this async context. */
   private _isCapturing(): boolean {
@@ -84,6 +87,9 @@ export class VantaTrace {
 
     // Start background system telemetry sampler (runs every 10 seconds, unrefed)
     startTelemetrySampling(10000);
+
+    // Initialize HTTP/HTTPS hooks for breadcrumbs
+    this._patchHttp();
 
     registerGlobalInstance(this, this.debug);
   }
@@ -187,10 +193,12 @@ export class VantaTrace {
       };
 
       // Ensure req reference and SDK-internal bookkeeping are removed from serialization scope
+      const breadcrumbs = mergedContext.breadcrumbs || [];
       delete (mergedContext as any).req;
       delete (mergedContext as any)._vantaCapturing;
       delete (mergedContext as any)._vantaErrorCaptured;
       delete (mergedContext as any)._vantaCaughtErrors;
+      delete (mergedContext as any).breadcrumbs;
 
       const payload: ErrorPayload = {
         apiKey: this.apiKey,
@@ -200,7 +208,8 @@ export class VantaTrace {
         error: normalized,
         context: mergedContext,
         system: systemContext,
-        severity: mergedContext.severity || 'critical'
+        severity: mergedContext.severity || 'critical',
+        breadcrumbs
       };
 
       if (this.debug) {
@@ -286,7 +295,8 @@ export class VantaTrace {
         metadata: {
           query: req.query,
           body: sanitizedBody
-        }
+        },
+        breadcrumbs: []
       };
 
       // Auto-capture: once the response has been sent, report swallowed errors
@@ -418,17 +428,16 @@ export class VantaTrace {
   }
 
   /**
-   * Safe monkey-patching of console.error
+   * Safe monkey-patching of console logs to record breadcrumbs
    */
   private _patchConsole(): void {
     const originalConsoleError = console.error;
+    const originalConsoleLog = console.log;
+    const originalConsoleWarn = console.warn;
+    const originalConsoleInfo = console.info;
     const self = this;
 
     console.error = function (...args: any[]) {
-      // Only CHECK the flag — do NOT set it here.
-      // captureException sets/clears it internally. Setting it here would
-      // cause captureException to see the flag and return early, silently
-      // dropping the error.
       if (!self._isCapturing()) {
         const error = args.find(arg => arg instanceof Error);
         if (error) {
@@ -440,10 +449,140 @@ export class VantaTrace {
           } catch (err) {
             // Fail-silent
           }
+        } else {
+          try {
+            self.addBreadcrumb({
+              category: 'console',
+              message: args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' '),
+              level: 'error',
+              type: 'log'
+            });
+          } catch (_) {}
         }
       }
       originalConsoleError.apply(console, args);
     };
+
+    console.log = function (...args: any[]) {
+      if (!self._consoleGuard) {
+        self._consoleGuard = true;
+        try {
+          self.addBreadcrumb({
+            category: 'console',
+            message: args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' '),
+            level: 'info',
+            type: 'log'
+          });
+        } catch (_) {}
+        self._consoleGuard = false;
+      }
+      originalConsoleLog.apply(console, args);
+    };
+
+    console.warn = function (...args: any[]) {
+      if (!self._consoleGuard) {
+        self._consoleGuard = true;
+        try {
+          self.addBreadcrumb({
+            category: 'console',
+            message: args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' '),
+            level: 'warning',
+            type: 'log'
+          });
+        } catch (_) {}
+        self._consoleGuard = false;
+      }
+      originalConsoleWarn.apply(console, args);
+    };
+
+    console.info = function (...args: any[]) {
+      if (!self._consoleGuard) {
+        self._consoleGuard = true;
+        try {
+          self.addBreadcrumb({
+            category: 'console',
+            message: args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' '),
+            level: 'info',
+            type: 'log'
+          });
+        } catch (_) {}
+        self._consoleGuard = false;
+      }
+      originalConsoleInfo.apply(console, args);
+    };
+  }
+
+  /**
+   * Public helper to record manual breadcrumbs
+   */
+  public addBreadcrumb(breadcrumb: Omit<Breadcrumb, 'timestamp'>): void {
+    try {
+      const store = VantaTrace.asyncLocalStorage.getStore() as any;
+      if (store) {
+        if (!store.breadcrumbs) store.breadcrumbs = [];
+        if (store.breadcrumbs.length >= 50) {
+          store.breadcrumbs.shift();
+        }
+        store.breadcrumbs.push({
+          ...breadcrumb,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (_) {}
+  }
+
+  /**
+   * Safe monkey-patching of outbound HTTP and HTTPS requests to log network breadcrumbs
+   */
+  private _patchHttp(): void {
+    const self = this;
+    try {
+      const http = require('http');
+      const https = require('https');
+
+      const patchRequest = (module: any, isHttps: boolean) => {
+        if (!module || !module.request) return;
+        const originalRequest = module.request;
+
+        module.request = function (options: any, ...args: any[]) {
+          try {
+            let urlStr = '';
+            let host = '';
+            if (typeof options === 'string') {
+              urlStr = options;
+              const parsed = new URL(options);
+              host = parsed.host;
+            } else if (options && typeof options === 'object') {
+              host = options.hostname || options.host || 'localhost';
+              const protocol = options.protocol || (isHttps ? 'https:' : 'http:');
+              const path = options.path || '/';
+              urlStr = `${protocol}//${host}${path}`;
+            }
+
+            // Exclude self-telemetry calls
+            const selfUrl = new URL(self.apiUrl);
+            if (host && selfUrl.host && host.toLowerCase() === selfUrl.host.toLowerCase()) {
+              return originalRequest.apply(this, [options, ...args]);
+            }
+
+            if (urlStr) {
+              const method = (options && options.method) || 'GET';
+              self.addBreadcrumb({
+                category: 'http',
+                message: `${method} ${urlStr}`,
+                level: 'info',
+                type: 'http',
+                data: { method, url: urlStr }
+              });
+            }
+          } catch (_) {}
+          return originalRequest.apply(this, [options, ...args]);
+        };
+      };
+
+      patchRequest(http, false);
+      patchRequest(https, true);
+    } catch (_) {}
   }
 
   /**

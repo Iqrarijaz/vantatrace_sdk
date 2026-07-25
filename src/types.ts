@@ -50,6 +50,15 @@ export interface VantaTraceOptions {
   autoCapture?: AutoCaptureOptions;
 }
 
+export interface Breadcrumb {
+  timestamp: string;
+  category: string;
+  message: string;
+  level: 'info' | 'warning' | 'error';
+  type?: string;
+  data?: Record<string, any>;
+}
+
 export interface VantaTraceContext {
   userId?: string;
   route?: string;
@@ -58,6 +67,7 @@ export interface VantaTraceContext {
   headers?: Record<string, any>;
   metadata?: Record<string, any>;
   severity?: 'critical' | 'warning' | 'info';
+  breadcrumbs?: Breadcrumb[];
 }
 
 /** Normalized cause chain entry for errors thrown with { cause: originalError }. */
@@ -105,4 +115,5 @@ export interface ErrorPayload {
     uptime: number;
   };
   severity?: 'critical' | 'warning' | 'info';
+  breadcrumbs?: Breadcrumb[];
 }
