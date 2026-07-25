@@ -6,11 +6,13 @@ import { getSystemContext, startTelemetrySampling } from './context';
 import { sendPayload } from './transport';
 import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
+import { deepScrub, scrubString, ScrubOptions } from './scrub';
 
 export class VantaTrace {
   private apiKey: string;
   private debug: boolean;
   private apiUrl: string;
+  private scrubOptions: ScrubOptions;
 
   // native AsyncLocalStorage store to capture request context
   private static asyncLocalStorage = new AsyncLocalStorage<VantaTraceContext>();
@@ -45,6 +47,11 @@ export class VantaTrace {
 
     // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
+
+    this.scrubOptions = {
+      sensitiveKeys: options.sensitiveKeys,
+      sensitivePatterns: options.sensitivePatterns
+    };
 
     if (!options.apiKey && this.debug) {
       console.warn('[VantaTrace] WARNING: API key is missing. SDK will run in dry-run mode.');
@@ -145,12 +152,39 @@ export class VantaTrace {
       // Ensure req reference is removed from serialization scope
       delete (mergedContext as any).req;
 
+      // Scrub PII/secrets before this payload ever leaves the process. Header
+      // redaction happens earlier (requestHandler), but error message/stack
+      // text, custom `extra` error properties, and metadata (which may include
+      // request body/query captured in requestHandler, or arbitrary fields a
+      // caller passed to captureException) can all carry embedded passwords,
+      // tokens, or PII that a key-name check alone wouldn't catch.
+      const scrubbedError = {
+        ...normalized,
+        message: scrubString(normalized.message, this.scrubOptions),
+        stack: scrubString(normalized.stack, this.scrubOptions),
+        extra: normalized.extra ? deepScrub(normalized.extra, this.scrubOptions) : normalized.extra,
+        cause: normalized.cause?.map((c) => ({
+          ...c,
+          message: scrubString(c.message, this.scrubOptions),
+          stack: scrubString(c.stack, this.scrubOptions)
+        }))
+      };
+      const scrubbedContext: VantaTraceContext = {
+        ...mergedContext,
+        // route can be re-derived from the live `req` reference (dynamicRoute
+        // above) after requestHandler already scrubbed its own copy — scrub
+        // again here so a raw req.url/path with an embedded query string
+        // (?password=...) can't bypass that via the dynamic-resolution path.
+        route: mergedContext.route ? scrubString(mergedContext.route, this.scrubOptions) : mergedContext.route,
+        metadata: mergedContext.metadata ? deepScrub(mergedContext.metadata, this.scrubOptions) : mergedContext.metadata
+      };
+
       const payload: ErrorPayload = {
         apiKey: this.apiKey,
         timestamp: new Date().toISOString(),
         traceId,
-        error: normalized,
-        context: mergedContext,
+        error: scrubbedError,
+        context: scrubbedContext,
         system: systemContext,
         severity: mergedContext.severity || 'critical'
       };
@@ -204,13 +238,16 @@ export class VantaTrace {
         userId = req.userId;
       }
 
-      // Sanitize request body if sensitive parameters exist
-      let sanitizedBody = undefined;
-      if (req.body && typeof req.body === 'object') {
-        sanitizedBody = { ...req.body };
-        if ('password' in sanitizedBody) sanitizedBody.password = '[REDACTED]';
-        if ('token' in sanitizedBody) sanitizedBody.token = '[REDACTED]';
-      }
+      // Deep-sanitize request body and query — recursively, not just a couple
+      // of well-known top-level field names — since passwords/tokens/PII can
+      // be nested (e.g. { user: { password: '...' } }) or under a field name
+      // the SDK doesn't special-case.
+      const sanitizedBody = req.body && typeof req.body === 'object'
+        ? deepScrub(req.body, this.scrubOptions)
+        : undefined;
+      const sanitizedQuery = req.query && typeof req.query === 'object'
+        ? deepScrub(req.query, this.scrubOptions)
+        : undefined;
 
       // Extract client IP
       const ip = req.ip || (req.headers['x-forwarded-for'] as string) || req.socket?.remoteAddress;
@@ -218,9 +255,11 @@ export class VantaTrace {
       // Extract and sanitize headers
       const sanitizedHeaders: Record<string, any> = {};
       const sensitiveHeaderKeys = ['authorization', 'cookie', 'set-cookie', 'x-api-key', 'proxy-authorization'];
+      const extraSensitiveKeys = (this.scrubOptions.sensitiveKeys || []).map((k) => k.toLowerCase());
       if (req.headers && typeof req.headers === 'object') {
         for (const [key, value] of Object.entries(req.headers)) {
-          if (sensitiveHeaderKeys.includes(key.toLowerCase())) {
+          const lowerKey = key.toLowerCase();
+          if (sensitiveHeaderKeys.includes(lowerKey) || extraSensitiveKeys.some((needle) => lowerKey.includes(needle))) {
             sanitizedHeaders[key] = '[REDACTED]';
           } else {
             sanitizedHeaders[key] = value;
@@ -228,15 +267,19 @@ export class VantaTrace {
         }
       }
 
+      // The raw request URL may itself carry a query string (?password=...) —
+      // scrub it too rather than only the parsed req.query object.
+      const sanitizedRoute = scrubString(req.route?.path || req.path || req.url || '', this.scrubOptions);
+
       const activeContext: any = {
         req, // Keep active request reference to dynamically resolve user/route parameters later
         userId: userId ? String(userId) : undefined,
-        route: req.route?.path || req.path || req.url,
+        route: sanitizedRoute,
         method: req.method,
         ip: ip ? String(ip) : undefined,
         headers: sanitizedHeaders,
         metadata: {
-          query: req.query,
+          query: sanitizedQuery,
           body: sanitizedBody
         }
       };
