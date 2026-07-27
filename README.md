@@ -130,6 +130,17 @@ object was swallowed. Disable with:
 new VantaTrace({ apiKey, autoCapture: { http5xx: false } });
 ```
 
+Two things make this safety net more useful without any extra config:
+
+- **The response body is captured too.** Whatever your catch block actually
+  sent back to the client (`res.json({ error: 'Order failed' })`,
+  `res.send(...)`) is attached as `metadata.responseBody` — often the single
+  most concrete clue about what went wrong, even with no recovered exception.
+- **The message tells you what to do next.** If `autoCapture.caughtExceptions`
+  isn't enabled, the synthetic error's message includes a pointer to section
+  4b below (or the Babel plugin) so the fix is discoverable from the
+  dashboard itself, not just this README.
+
 #### 4b. Deep capture via the V8 inspector (opt-in)
 
 JavaScript has no language-level hook for caught exceptions — `try/catch` is
@@ -341,7 +352,8 @@ Async Queue → Ingestion API → Dashboard
 ## 🔒 Security
 
 Sensitive fields are automatically redacted: password, token,
-authorization, cookie, x-api-key
+authorization, cookie, x-api-key — in the request body, the query string, and
+HTTP headers alike.
 
 ------------------------------------------------------------------------
 
