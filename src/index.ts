@@ -210,6 +210,7 @@ export class VantaTrace {
       delete (mergedContext as any)._vantaCapturing;
       delete (mergedContext as any)._vantaErrorCaptured;
       delete (mergedContext as any)._vantaCaughtErrors;
+      delete (mergedContext as any)._vantaResponseBody;
       delete (mergedContext as any).breadcrumbs;
 
       const payload: ErrorPayload = {
@@ -284,17 +285,22 @@ export class VantaTrace {
         userInfo = { id: userId };
       }
 
-      // Deeply sanitize request body
-      let sanitizedBody: any = undefined;
-      if (req.body && typeof req.body === 'object') {
-        sanitizedBody = { ...req.body };
+      // Redact sensitive-looking keys from a shallow object copy (request body,
+      // query string params — anywhere user-supplied key/value pairs land).
+      const redactSensitiveKeys = (obj: any): any => {
+        if (!obj || typeof obj !== 'object') return obj;
         const sensitiveKeys = ['password', 'token', 'secret', 'auth', 'pin', 'creditcard', 'cvv'];
-        for (const key of Object.keys(sanitizedBody)) {
+        const copy = { ...obj };
+        for (const key of Object.keys(copy)) {
           if (sensitiveKeys.some((s) => key.toLowerCase().includes(s))) {
-            sanitizedBody[key] = '[REDACTED]';
+            copy[key] = '[REDACTED]';
           }
         }
-      }
+        return copy;
+      };
+
+      const sanitizedBody: any = req.body && typeof req.body === 'object' ? redactSensitiveKeys(req.body) : undefined;
+      const sanitizedQuery: any = req.query && typeof req.query === 'object' ? redactSensitiveKeys(req.query) : undefined;
 
       // Extract client IP & Geo headers
       const ip = req.ip || (req.headers && (req.headers['x-forwarded-for'] as string)) || req.socket?.remoteAddress;
@@ -332,18 +338,44 @@ export class VantaTrace {
         ip: ip ? String(ip) : undefined,
         headers: sanitizedHeaders,
         body: sanitizedBody,
-        query: req.query && typeof req.query === 'object' ? req.query : undefined,
+        query: sanitizedQuery,
         geo,
         sessionId: sessionId ? String(sessionId) : undefined,
         correlationId: correlationId ? String(correlationId) : undefined,
         featureFlags: featureFlags && typeof featureFlags === 'object' ? featureFlags : undefined,
         startTime,
-        metadata: {
-          query: req.query,
-          body: sanitizedBody
-        },
+        // Reserved for whatever a developer passes to captureException()'s own
+        // `metadata` — auto-captured request data already has its own fields
+        // above (body/query/etc.), so it isn't duplicated in here too.
+        metadata: {},
         breadcrumbs: []
       };
+
+      // Record the outgoing response body when the request ends up failing, so
+      // a swallowed try/catch (no exception object, no autoCapture.caughtExceptions)
+      // still surfaces *something* concrete about what went wrong — e.g. the
+      // `{ error: 'Order failed' }` a catch block sent back to the client.
+      // Whichever of res.json/res.send fires first wins; Express commonly calls
+      // one through the other internally, so the second call is a no-op here.
+      const recordResponseBody = (body: any) => {
+        if (activeContext._vantaResponseBody === undefined) {
+          activeContext._vantaResponseBody = body;
+        }
+      };
+      if (res && typeof res.json === 'function') {
+        const originalJson = res.json.bind(res);
+        res.json = (body: any) => {
+          try { recordResponseBody(body); } catch (_) {}
+          return originalJson(body);
+        };
+      }
+      if (res && typeof res.send === 'function') {
+        const originalSend = res.send.bind(res);
+        res.send = (body: any) => {
+          try { recordResponseBody(body); } catch (_) {}
+          return originalSend(body);
+        };
+      }
 
       // Auto-capture: once the response has been sent, report swallowed errors
       // for requests that failed with a 5xx status. 'finish' fires per response
@@ -413,6 +445,12 @@ export class VantaTrace {
         VantaTrace.asyncLocalStorage.run(store, () => this.captureException(error, context));
       };
 
+      // The body actually sent back to the client — often the single most
+      // concrete clue about what a swallowed catch block did, even when no
+      // exception object was ever reported. Capped by the transport's own
+      // payload size handling downstream; nothing extra to do here.
+      const responseBody = store._vantaResponseBody;
+
       const caughtErrors: any[] = store._vantaCaughtErrors || [];
       if (caughtErrors.length > 0) {
         // The first caught exception is the root cause; later ones are usually
@@ -424,6 +462,7 @@ export class VantaTrace {
             captureStrategy: 'caughtException',
             handled: true,
             httpStatusCode: status,
+            ...(responseBody !== undefined ? { responseBody } : {}),
             ...(rest.length > 0
               ? { additionalCaughtErrors: rest.map(e => `${e?.name || 'Error'}: ${e?.message || String(e)}`) }
               : {})
@@ -436,9 +475,16 @@ export class VantaTrace {
 
       const method = req?.method || store.method || 'UNKNOWN';
       const route = store.route || req?.originalUrl || req?.url || 'unknown route';
+      // Only nudge toward the caught-exception capture layers when they aren't
+      // already active — no point telling someone to turn on a watcher that's
+      // already running (it simply didn't observe a throw for this request,
+      // e.g. because it originated inside node_modules).
+      const hint = this.stopCaughtWatcher
+        ? ''
+        : ' Enable autoCapture.caughtExceptions (or use @vantatrace/sdk/babel-plugin) to capture the real error object automatically.';
       const synthetic = new Error(
         `${method} ${route} responded with HTTP ${status} but no exception was reported ` +
-        `(likely swallowed by a try/catch block)`
+        `(likely swallowed by a try/catch block).${hint}`
       );
       synthetic.name = 'HttpServerError';
       capture(synthetic, {
@@ -446,7 +492,8 @@ export class VantaTrace {
         metadata: {
           captureStrategy: 'http5xx',
           handled: true,
-          httpStatusCode: status
+          httpStatusCode: status,
+          ...(responseBody !== undefined ? { responseBody } : {})
         }
       });
     } catch (_e) {
