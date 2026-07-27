@@ -59,12 +59,35 @@ export interface Breadcrumb {
   data?: Record<string, any>;
 }
 
+export interface UserContextInfo {
+  id?: string;
+  email?: string;
+  role?: string;
+  tenantId?: string;
+  orgId?: string;
+}
+
+export interface GeoLocationInfo {
+  ip?: string;
+  country?: string;
+  region?: string;
+  city?: string;
+}
+
 export interface VantaTraceContext {
   userId?: string;
+  user?: UserContextInfo;
   route?: string;
   method?: string;
   ip?: string;
   headers?: Record<string, any>;
+  body?: Record<string, any>;
+  query?: Record<string, any>;
+  geo?: GeoLocationInfo;
+  duration?: number;
+  featureFlags?: Record<string, any>;
+  sessionId?: string;
+  correlationId?: string;
   metadata?: Record<string, any>;
   severity?: 'critical' | 'warning' | 'info';
   breadcrumbs?: Breadcrumb[];

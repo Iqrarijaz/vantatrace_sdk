@@ -199,9 +199,14 @@ export class VantaTrace {
         }
       };
 
+      if (activeStoreCopy.startTime && !mergedContext.duration) {
+        mergedContext.duration = Date.now() - activeStoreCopy.startTime;
+      }
+
       // Ensure req reference and SDK-internal bookkeeping are removed from serialization scope
       const breadcrumbs = mergedContext.breadcrumbs || [];
       delete (mergedContext as any).req;
+      delete (mergedContext as any).startTime;
       delete (mergedContext as any)._vantaCapturing;
       delete (mergedContext as any)._vantaErrorCaptured;
       delete (mergedContext as any)._vantaCaughtErrors;
@@ -261,23 +266,44 @@ export class VantaTrace {
    */
   public requestHandler() {
     return (req: any, res: any, next: any) => {
-      let userId = undefined;
+      const startTime = Date.now();
+      let userId: string | undefined = undefined;
+      let userInfo: any = undefined;
+
       if (req.user && typeof req.user === 'object') {
-        userId = req.user.id || req.user._id || req.user.userId;
+        userId = String(req.user.id || req.user._id || req.user.userId || '');
+        userInfo = {
+          id: userId || undefined,
+          email: req.user.email,
+          role: req.user.role,
+          tenantId: req.user.tenantId || req.user.tenant_id,
+          orgId: req.user.orgId || req.user.organizationId || req.user.org_id
+        };
       } else if (req.userId) {
-        userId = req.userId;
+        userId = String(req.userId);
+        userInfo = { id: userId };
       }
 
-      // Sanitize request body if sensitive parameters exist
-      let sanitizedBody = undefined;
+      // Deeply sanitize request body
+      let sanitizedBody: any = undefined;
       if (req.body && typeof req.body === 'object') {
         sanitizedBody = { ...req.body };
-        if ('password' in sanitizedBody) sanitizedBody.password = '[REDACTED]';
-        if ('token' in sanitizedBody) sanitizedBody.token = '[REDACTED]';
+        const sensitiveKeys = ['password', 'token', 'secret', 'auth', 'pin', 'creditcard', 'cvv'];
+        for (const key of Object.keys(sanitizedBody)) {
+          if (sensitiveKeys.some((s) => key.toLowerCase().includes(s))) {
+            sanitizedBody[key] = '[REDACTED]';
+          }
+        }
       }
 
-      // Extract client IP
-      const ip = req.ip || (req.headers['x-forwarded-for'] as string) || req.socket?.remoteAddress;
+      // Extract client IP & Geo headers
+      const ip = req.ip || (req.headers && (req.headers['x-forwarded-for'] as string)) || req.socket?.remoteAddress;
+      const geo = {
+        ip: ip ? String(ip) : undefined,
+        country: req.headers ? (req.headers['cf-ipcountry'] || req.headers['x-country'] || req.headers['x-geoip-country']) as string : undefined,
+        region: req.headers ? (req.headers['x-region'] || req.headers['x-geoip-region']) as string : undefined,
+        city: req.headers ? (req.headers['x-city'] || req.headers['x-geoip-city']) as string : undefined,
+      };
 
       // Extract and sanitize headers
       const sanitizedHeaders: Record<string, any> = {};
@@ -292,13 +318,26 @@ export class VantaTrace {
         }
       }
 
+      // Extract session ID and correlation ID
+      const sessionId = req.sessionID || req.session?.id || req.headers?.['x-session-id'];
+      const correlationId = req.headers?.['x-correlation-id'] || req.headers?.['x-request-id'] || req.headers?.['x-trace-id'];
+      const featureFlags = req.featureFlags || req.flags || req.experiments;
+
       const activeContext: any = {
-        req, // Keep active request reference to dynamically resolve user/route parameters later
-        userId: userId ? String(userId) : undefined,
+        req,
+        userId: userId || undefined,
+        user: userInfo,
         route: req.route?.path || req.path || req.url,
         method: req.method,
         ip: ip ? String(ip) : undefined,
         headers: sanitizedHeaders,
+        body: sanitizedBody,
+        query: req.query && typeof req.query === 'object' ? req.query : undefined,
+        geo,
+        sessionId: sessionId ? String(sessionId) : undefined,
+        correlationId: correlationId ? String(correlationId) : undefined,
+        featureFlags: featureFlags && typeof featureFlags === 'object' ? featureFlags : undefined,
+        startTime,
         metadata: {
           query: req.query,
           body: sanitizedBody

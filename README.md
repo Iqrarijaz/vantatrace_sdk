@@ -19,6 +19,8 @@ asynchronously and never blocks your application runtime.
     failures\
 -   🔍 Rich runtime context --- request, system, and environment
     metadata\
+-   ⛓️ Root Cause Chains --- automatically walks and captures native `Error.cause` chains\
+-   🏷️ Rich Error Parameters --- auto-extracts `code`, `statusCode`, and custom error parameters (`extra`)\
 -   🔒 Secure by default --- automatic redaction of sensitive data\
 -   🌐 Multi-service support --- built for microservices architecture\
 -   📊 Structured telemetry --- normalized event payloads\
@@ -208,6 +210,29 @@ try {
   });
 }
 ```
+
+### 5a. Error Context & Root Cause Chains
+
+VantaTrace automatically extracts and normalizes the following properties directly from your captured Error objects:
+- **`code`**: System or custom error codes (e.g. `ENOENT`, `ECONNREFUSED`).
+- **`statusCode`**: HTTP response status codes (e.g. `404`, `500`).
+- **`extra`**: Any custom properties attached to the Error instance at throw-time (e.g. `error.userId = 'user_1'`).
+- **`cause` (Nested Cause Chains)**: If your errors utilize the native `Error.cause` option, VantaTrace recursively walks the entire chain and normalizes it.
+
+Example of nested cause chains:
+``` javascript
+try {
+  try {
+    throw new Error('Database connection failed', { cause: new Error('Socket timeout') });
+  } catch (dbErr) {
+    throw new Error('Failed to checkout order', { cause: dbErr });
+  }
+} catch (error) {
+  vantaTrace.captureException(error); // captures: Order error -> DB error -> Socket timeout
+}
+```
+
+On the dashboard, the entire root-cause chain is rendered as an interactive visual timeline directly under the main stack trace block.
 
 ------------------------------------------------------------------------
 
