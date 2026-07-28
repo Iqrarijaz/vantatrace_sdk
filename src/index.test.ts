@@ -337,3 +337,78 @@ test('auto-captured request context no longer duplicates query/body under metada
   assert.deepEqual(store.body, { name: 'ok' });
   assert.deepEqual(store.metadata, {});
 });
+
+// The following tests read the ALS store directly (see the note on the two
+// tests above) since msisdn/userId are auto-extracted request fields, not
+// something a caller passes to captureException() explicitly.
+function storeFromRequest(instance: VantaTrace, req: any, res: any): any {
+  let store: any;
+  instance.requestHandler()(req, res, () => {
+    store = (VantaTrace as any).asyncLocalStorage.getStore();
+  });
+  return store;
+}
+
+test('msisdn is read from the X-MSISDN header via req.get()', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'x-msisdn' ? '+1 (415) 555-2671' : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.msisdn, '+14155552671');
+});
+
+test('msisdn falls back to a plain x-msisdn header when req.get is unavailable', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.headers['x-msisdn'] = '923001234567';
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.msisdn, '923001234567');
+});
+
+test('msisdn is read from req.user.phone / mobilephone when no header is present', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+
+  const { req: req1, res: res1 } = fakeReqRes(200);
+  req1.user = { id: 'u1', phone: '+14155552671' };
+  assert.equal(storeFromRequest(instance, req1, res1).msisdn, '+14155552671');
+
+  const { req: req2, res: res2 } = fakeReqRes(200);
+  req2.user = { id: 'u1', mobilephone: '+14155552671' };
+  assert.equal(storeFromRequest(instance, req2, res2).msisdn, '+14155552671');
+});
+
+test('a value that does not look like a phone number is dropped, not forwarded', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.user = { id: 'u1', phone: 'not-a-phone-number' };
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.msisdn, undefined);
+});
+
+test('userId falls back to req.userId even when req.user exists but has no id fields', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.user = { email: 'user@example.com' }; // no id/_id/userId on req.user itself
+  req.userId = 'fallback-id-123';
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.userId, 'fallback-id-123');
+});
+
+test('userId prefers req.user._id when req.user.id is absent', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.user = { _id: 'mongo-object-id' };
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.userId, 'mongo-object-id');
+});

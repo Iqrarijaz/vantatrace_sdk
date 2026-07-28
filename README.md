@@ -99,6 +99,19 @@ app.use((err, req, res, next) => {
 > [!NOTE]
 > `vantaTrace.expressMiddleware()` is deprecated but preserved as an alias to `errorHandler()` for backward compatibility.
 
+**User identification.** `requestHandler()` resolves the current user's ID from
+`req.user.id`, `req.user._id`, `req.user.userId`, or `req.userId` (checked in
+that order, whichever request-auth middleware you use), and a phone number
+(MSISDN) from the `X-MSISDN` header or `req.user.phone` /
+`req.user.mobilephone` / `req.user.msisdn` / `req.user.phoneNumber` /
+`req.user.mobileNumber`. The phone number is normalized (formatting
+characters stripped) and validated as phone-shaped before being attached to
+`context.msisdn` — anything that doesn't look like a real number is dropped
+rather than forwarded. Both are stored as their own indexed columns on the
+backend (not just inside the JSON context blob), so per-user and
+per-phone-number filtering and trend graphs don't require parsing JSON per
+row.
+
 ------------------------------------------------------------------------
 
 ### 4. Automatic Capture of Errors Handled in try/catch (Runtime)

@@ -268,22 +268,44 @@ export class VantaTrace {
   public requestHandler() {
     return (req: any, res: any, next: any) => {
       const startTime = Date.now();
-      let userId: string | undefined = undefined;
-      let userInfo: any = undefined;
 
-      if (req.user && typeof req.user === 'object') {
-        userId = String(req.user.id || req.user._id || req.user.userId || '');
-        userInfo = {
-          id: userId || undefined,
-          email: req.user.email,
-          role: req.user.role,
-          tenantId: req.user.tenantId || req.user.tenant_id,
-          orgId: req.user.orgId || req.user.organizationId || req.user.org_id
-        };
-      } else if (req.userId) {
-        userId = String(req.userId);
-        userInfo = { id: userId };
-      }
+      // Unified fallback chain regardless of whether req.user is present as
+      // an object at all — req.userId is checked either way, not only when
+      // req.user is missing/not-an-object.
+      const rawUserId = (req.user && typeof req.user === 'object' ? (req.user.id || req.user._id || req.user.userId) : undefined) || req.userId;
+      const userId: string | undefined = rawUserId ? String(rawUserId) : undefined;
+      const userInfo: any =
+        req.user && typeof req.user === 'object'
+          ? {
+              id: userId,
+              email: req.user.email,
+              role: req.user.role,
+              tenantId: req.user.tenantId || req.user.tenant_id,
+              orgId: req.user.orgId || req.user.organizationId || req.user.org_id
+            }
+          : userId
+            ? { id: userId }
+            : undefined;
+
+      // MSISDN (phone number), from the first source that yields a
+      // plausible-looking phone number: a dedicated header, then common
+      // req.user field name variants. Normalized (non-digit/non-plus
+      // characters stripped) and validated as phone-shaped (7-15 digits,
+      // optional leading +, per the E.164 max length) before being accepted —
+      // anything that doesn't look like a phone number is dropped rather than
+      // forwarded as-is.
+      const rawMsisdn =
+        (typeof req.get === 'function' ? req.get('X-MSISDN') : undefined) ||
+        req.headers?.['x-msisdn'] ||
+        (req.user && typeof req.user === 'object'
+          ? req.user.phone || req.user.mobilephone || req.user.mobilePhone || req.user.msisdn ||
+            req.user.phoneNumber || req.user.mobileNumber
+          : undefined);
+      const msisdn: string | undefined = (() => {
+        if (typeof rawMsisdn !== 'string' && typeof rawMsisdn !== 'number') return undefined;
+        const cleaned = String(rawMsisdn).trim().replace(/[^\d+]/g, '');
+        return /^\+?\d{7,15}$/.test(cleaned) ? cleaned : undefined;
+      })();
 
       // Redact sensitive-looking keys from a shallow object copy (request body,
       // query string params — anywhere user-supplied key/value pairs land).
@@ -343,6 +365,7 @@ export class VantaTrace {
         sessionId: sessionId ? String(sessionId) : undefined,
         correlationId: correlationId ? String(correlationId) : undefined,
         featureFlags: featureFlags && typeof featureFlags === 'object' ? featureFlags : undefined,
+        msisdn,
         startTime,
         // Reserved for whatever a developer passes to captureException()'s own
         // `metadata` — auto-captured request data already has its own fields

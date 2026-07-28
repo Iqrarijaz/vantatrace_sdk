@@ -88,6 +88,8 @@ export interface VantaTraceContext {
   featureFlags?: Record<string, any>;
   sessionId?: string;
   correlationId?: string;
+  /** Phone number (MSISDN), normalized to digits with an optional leading '+'. */
+  msisdn?: string;
   metadata?: Record<string, any>;
   severity?: 'critical' | 'warning' | 'info';
   breadcrumbs?: Breadcrumb[];
