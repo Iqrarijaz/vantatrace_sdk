@@ -412,3 +412,52 @@ test('userId prefers req.user._id when req.user.id is absent', () => {
   const store = storeFromRequest(instance, req, res);
   assert.equal(store.userId, 'mongo-object-id');
 });
+
+test('an X-MPIN header is redacted before it ever leaves requestHandler(), not just at the backend', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'x-mpin' ? '1234' : undefined);
+  req.headers['x-mpin'] = '1234'; // also present as a plain header, as it would be over HTTP
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.headers['x-mpin'], '[REDACTED]');
+});
+
+test('other sensitive-shaped headers (auth, cookies, api keys) are still redacted after the refactor', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.headers = {
+    authorization: 'Bearer secret-token',
+    cookie: 'session=abc123',
+    'x-api-key': 'ep_live_abc',
+    'x-request-id': 'req-1', // not sensitive — should pass through untouched
+  };
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.headers.authorization, '[REDACTED]');
+  assert.equal(store.headers.cookie, '[REDACTED]');
+  assert.equal(store.headers['x-api-key'], '[REDACTED]');
+  assert.equal(store.headers['x-request-id'], 'req-1');
+});
+
+test('app version is captured from the X-APP-VERSION header via req.get()', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'x-app-version' ? '2.4.1' : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.appVersion, '2.4.1');
+});
+
+test('app version falls back to a plain x-app-version header when req.get is unavailable', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.headers['x-app-version'] = '3.0.0-beta.2';
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.appVersion, '3.0.0-beta.2');
+});

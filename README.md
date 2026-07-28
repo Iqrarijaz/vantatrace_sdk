@@ -112,6 +112,21 @@ backend (not just inside the JSON context blob), so per-user and
 per-phone-number filtering and trend graphs don't require parsing JSON per
 row.
 
+**App version.** The `X-APP-VERSION` header (whatever version string your
+client sends) is captured into `context.appVersion` — no format validation,
+since version strings vary (semver, build numbers, etc.), just trimmed and
+length-capped. Useful for spotting version-specific regressions ("only
+v2.3.0 clients hit this").
+
+**Headers carrying secrets are always redacted, never captured.** Any header
+whose name looks like it carries a secret — `Authorization`, `Cookie`,
+`X-Api-Key`, and (importantly) **`X-MPIN`** — is replaced with `[REDACTED]`
+in `context.headers` before the event ever leaves `requestHandler()`. This
+uses the same substring check as body/query redaction (`password`, `token`,
+`secret`, `auth`, `pin`, `creditcard`, `cvv`, `cookie`, `api-key`), so an MPIN
+sent as a header is never stored, logged, or forwarded in any form —
+independent of the backend's own defense-in-depth scrubbing.
+
 ------------------------------------------------------------------------
 
 ### 4. Automatic Capture of Errors Handled in try/catch (Runtime)
@@ -364,9 +379,10 @@ Async Queue → Ingestion API → Dashboard
 
 ## 🔒 Security
 
-Sensitive fields are automatically redacted: password, token,
-authorization, cookie, x-api-key — in the request body, the query string, and
-HTTP headers alike.
+Sensitive fields are automatically redacted: password, token, secret,
+authorization, cookie, api-key, pin/mpin, credit card, cvv — in the request
+body, the query string, and HTTP headers alike (so an `X-MPIN` header is
+redacted the same way a `password` body field is).
 
 ------------------------------------------------------------------------
 

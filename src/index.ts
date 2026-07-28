@@ -307,14 +307,26 @@ export class VantaTrace {
         return /^\+?\d{7,15}$/.test(cleaned) ? cleaned : undefined;
       })();
 
+      // Substrings that mark a key (request body/query field, or header name)
+      // as sensitive — matched case-insensitively anywhere in the key, so e.g.
+      // 'mpin'/'x-mpin' are covered by 'pin', 'authorization'/
+      // 'proxy-authorization' by 'auth', 'set-cookie' by 'cookie', and
+      // 'x-api-key' by 'api-key'. Shared by body, query, and header
+      // sanitization below so a header carrying the same kind of value (an
+      // MPIN, a token, ...) gets the same treatment as a body/query field.
+      const SENSITIVE_KEY_SUBSTRINGS = ['password', 'token', 'secret', 'auth', 'pin', 'creditcard', 'cvv', 'cookie', 'api-key'];
+      const isSensitiveKey = (key: string): boolean => {
+        const lower = key.toLowerCase();
+        return SENSITIVE_KEY_SUBSTRINGS.some((s) => lower.includes(s));
+      };
+
       // Redact sensitive-looking keys from a shallow object copy (request body,
       // query string params — anywhere user-supplied key/value pairs land).
       const redactSensitiveKeys = (obj: any): any => {
         if (!obj || typeof obj !== 'object') return obj;
-        const sensitiveKeys = ['password', 'token', 'secret', 'auth', 'pin', 'creditcard', 'cvv'];
         const copy = { ...obj };
         for (const key of Object.keys(copy)) {
-          if (sensitiveKeys.some((s) => key.toLowerCase().includes(s))) {
+          if (isSensitiveKey(key)) {
             copy[key] = '[REDACTED]';
           }
         }
@@ -333,18 +345,24 @@ export class VantaTrace {
         city: req.headers ? (req.headers['x-city'] || req.headers['x-geoip-city']) as string : undefined,
       };
 
-      // Extract and sanitize headers
+      // Extract and sanitize headers — same substring check as body/query, so
+      // an X-MPIN (or any other password/token/pin/cookie/api-key-shaped)
+      // header is redacted before it ever leaves requestHandler(), independent
+      // of the backend's own defense-in-depth scrubbing.
       const sanitizedHeaders: Record<string, any> = {};
-      const sensitiveHeaderKeys = ['authorization', 'cookie', 'set-cookie', 'x-api-key', 'proxy-authorization'];
       if (req.headers && typeof req.headers === 'object') {
         for (const [key, value] of Object.entries(req.headers)) {
-          if (sensitiveHeaderKeys.includes(key.toLowerCase())) {
-            sanitizedHeaders[key] = '[REDACTED]';
-          } else {
-            sanitizedHeaders[key] = value;
-          }
+          sanitizedHeaders[key] = isSensitiveKey(key) ? '[REDACTED]' : value;
         }
       }
+
+      // App version, from the client's own reported version string — used to
+      // spot version-specific regressions (e.g. "only v2.3.0 clients hit this").
+      // No format validation beyond trimming/length-capping: unlike msisdn,
+      // there's no single expected shape (semver, build numbers, etc. all vary).
+      const rawAppVersion = (typeof req.get === 'function' ? req.get('X-APP-VERSION') : undefined) || req.headers?.['x-app-version'];
+      const appVersion: string | undefined =
+        typeof rawAppVersion === 'string' && rawAppVersion.trim() ? rawAppVersion.trim().slice(0, 64) : undefined;
 
       // Extract session ID and correlation ID
       const sessionId = req.sessionID || req.session?.id || req.headers?.['x-session-id'];
@@ -366,6 +384,7 @@ export class VantaTrace {
         correlationId: correlationId ? String(correlationId) : undefined,
         featureFlags: featureFlags && typeof featureFlags === 'object' ? featureFlags : undefined,
         msisdn,
+        appVersion,
         startTime,
         // Reserved for whatever a developer passes to captureException()'s own
         // `metadata` — auto-captured request data already has its own fields
