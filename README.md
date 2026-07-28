@@ -1,75 +1,124 @@
 # 🚀 VantaTrace Node.js SDK
 
-**VantaTrace** is a lightweight, high-performance observability SDK for
-Node.js microservices and Express.js APIs.
+[![npm version](https://img.shields.io/npm/v/@vantatrace/sdk.svg)](https://www.npmjs.com/package/@vantatrace/sdk)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![TypeScript](https://img.shields.io/badge/TypeScript-full%20types-3178c6.svg)](#typescript-support)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D16-339933.svg)](#requirements)
 
-It provides real-time **exception tracking, structured telemetry, and
-runtime context capture**, enabling developers to detect, group, and
-debug production issues with minimal overhead.
+**VantaTrace** is a lightweight, high-performance observability SDK for Node.js
+microservices and Express.js APIs. It captures **exceptions, structured
+telemetry, and runtime context** — including errors your code already
+recovers from in a `try/catch` — and ships them to your VantaTrace project
+asynchronously, so instrumentation never adds meaningful latency to a request.
 
-Designed for modern distributed systems, VantaTrace runs fully
-asynchronously and never blocks your application runtime.
+This README is the complete guide: every public API, every config option, and
+every automatic behavior the SDK performs on your behalf, documented in one
+place.
 
-------------------------------------------------------------------------
+---
+
+## Table of Contents
+
+- [Features](#-key-features)
+- [Installation](#-installation)
+- [Requirements](#requirements)
+- [Quick Start](#-quick-start)
+- [Configuration Reference](#configuration-reference)
+- [Express Integration](#express-integration)
+  - [Automatic Context Enrichment](#automatic-context-enrichment)
+- [Manual Error Capturing](#manual-error-capturing)
+  - [Error Context & Root Cause Chains](#error-context--root-cause-chains)
+- [Automatic Capture of try/catch Errors](#automatic-capture-of-trycatch-errors)
+- [Zero-Code Auto-Capture (Babel Plugin)](#zero-code-auto-capture-babel-plugin)
+- [Breadcrumbs](#breadcrumbs)
+- [Logger Integrations (Winston / Pino)](#logger-integrations-winston--pino)
+- [Trace IDs & Log Correlation](#trace-ids--log-correlation)
+- [Global Process Handlers](#global-process-handlers)
+- [Security & Data Redaction](#security--data-redaction)
+- [Performance, Reliability & Internals](#performance-reliability--internals)
+- [TypeScript Support](#typescript-support)
+- [API Reference](#api-reference)
+- [Multiple Instances / Microservices](#multiple-instances--microservices)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
 
 ## ✨ Key Features
 
--   ⚡ Zero-blocking architecture --- async ingestion pipeline\
--   🧠 Smart error grouping (fingerprinting) --- deduplicates identical
-    failures\
--   🔍 Rich runtime context --- request, system, and environment
-    metadata\
--   ⛓️ Root Cause Chains --- automatically walks and captures native `Error.cause` chains\
--   🏷️ Rich Error Parameters --- auto-extracts `code`, `statusCode`, and custom error parameters (`extra`)\
--   🔒 Secure by default --- automatic redaction of sensitive data\
--   🌐 Multi-service support --- built for microservices architecture\
--   📊 Structured telemetry --- normalized event payloads\
--   🧩 Express.js integration --- plug-and-play middleware
+- ⚡ **Zero-blocking architecture** — every send is async, batched, and never awaited on your request path
+- 🧠 **Smart error grouping** — errors are fingerprinted (name + message + stack shape) so identical failures dedupe into one issue instead of flooding your dashboard
+- 🔍 **Rich runtime context** — request, user, system, and environment metadata attached automatically
+- 🪤 **Catches errors your code already swallows** — a failed-request safety net plus an opt-in V8-inspector watcher recover exceptions handled inside `try/catch`, not just ones that escape to Express's error handler
+- ⛓️ **Root cause chains** — automatically walks and captures native `Error.cause` chains
+- 🏷️ **Rich error parameters** — auto-extracts `code`, `statusCode`, and any custom properties attached to the Error instance (`extra`)
+- 🍞 **Breadcrumbs** — automatic console/HTTP breadcrumb trail, plus a manual API
+- 📎 **Trace ID correlation** — every captured error carries a trace ID you can stamp onto your own logs
+- 🪵 **Logger integrations** — auto-patches Winston and Pino to capture logged errors, no extra wiring
+- 🔒 **Secure by default** — automatic redaction of passwords, tokens, secrets, cookies, PINs, and card data in bodies, query strings, and headers alike
+- 🧩 **Zero-code instrumentation** — an optional Babel plugin injects capture calls into every `try/catch` at build time, with zero runtime overhead
+- 🌐 **Multi-service support** — a `serviceName` label per instance, built for microservice fleets
+- 🛡️ **Self-defending transport** — backpressure ceilings, retry, gzip, connection pooling, and an automatic kill-switch if your API key is disabled
+- 📘 **Full TypeScript support** — written in TypeScript, ships with `.d.ts` declarations
 
-------------------------------------------------------------------------
+---
 
 ## 📦 Installation
 
-``` bash
+```bash
 npm install @vantatrace/sdk
 ```
 
-------------------------------------------------------------------------
+### Requirements
+
+- **Node.js 16+** (the SDK relies on `AsyncLocalStorage` and `crypto.randomUUID`)
+- Express is optional — `requestHandler()`/`errorHandler()` are Express middleware, but `captureException()` and global handlers work in any Node.js process (workers, cron jobs, queue consumers)
+- Winston/Pino are optional peer integrations — the SDK detects them at runtime and does nothing if they aren't installed
+
+---
 
 ## ⚡ Quick Start
 
-First, sign up and get your API keys from [https://vantatrace.com](https://vantatrace.com) to get started.
+First, sign up and get your API key from [https://vantatrace.com](https://vantatrace.com).
 
-### 1. Initialize SDK
+### 1. Initialize the SDK
 
-``` javascript
+Construct exactly **one** `VantaTrace` instance per process, in your
+application's entrypoint:
+
+```javascript
 import { VantaTrace } from '@vantatrace/sdk';
 
 const vantaTrace = new VantaTrace({
-  apiKey: 'YOUR_PROJECT_API_KEY', // Get your API Key from https://vantatrace.com (starts with ep_live_ or ep_test_)
-  serviceName: 'checkout-service', // optional — labels events on the dashboard (defaults to your project name)
+  apiKey: 'YOUR_PROJECT_API_KEY', // starts with ep_live_ or ep_test_
+  serviceName: 'checkout-service', // optional — labels events on the dashboard
   debug: false
 });
 ```
 
-------------------------------------------------------------------------
-
 ### 2. Enable Global Error Tracking
 
-``` javascript
+```javascript
 vantaTrace.initGlobalHandlers();
 ```
 
-------------------------------------------------------------------------
+This wires up three safety nets in one call: uncaught exceptions, unhandled
+promise rejections, and interception of errors logged via `console.error`,
+Winston, or Pino. See [Global Process Handlers](#global-process-handlers).
 
 ### 3. Express Middleware Integration
 
-VantaTrace uses a decoupled two-part middleware design for Express to ensure complete request context tracking without leaking scopes:
+VantaTrace uses a decoupled two-part middleware design for Express to ensure
+complete request context tracking without leaking scopes:
 
-1. **`requestHandler()`**: Mounted at the very top of your middleware stack (before any routes or body parsers) to establish the `AsyncLocalStorage` request context.
-2. **`errorHandler()`**: Mounted at the very bottom of your middleware stack (after all routes and controllers) to capture unhandled exceptions under the correct request context.
+1. **`requestHandler()`** — mounted at the very top of your middleware stack
+   (before any routes or body parsers) to establish the `AsyncLocalStorage`
+   request context.
+2. **`errorHandler()`** — mounted at the very bottom of your middleware stack
+   (after all routes and controllers) to capture unhandled exceptions under
+   the correct request context.
 
-``` javascript
+```javascript
 import express from 'express';
 import { VantaTrace } from '@vantatrace/sdk';
 
@@ -97,43 +146,168 @@ app.use((err, req, res, next) => {
 ```
 
 > [!NOTE]
-> `vantaTrace.expressMiddleware()` is deprecated but preserved as an alias to `errorHandler()` for backward compatibility.
+> `vantaTrace.expressMiddleware()` is deprecated but preserved as an alias for
+> `errorHandler()` for backward compatibility.
 
-**User identification.** `requestHandler()` resolves the current user's ID from
-`req.user.id`, `req.user._id`, `req.user.userId`, or `req.userId` (checked in
-that order, whichever request-auth middleware you use), and a phone number
-(MSISDN) from the `X-MSISDN` header or `req.user.phone` /
-`req.user.mobilephone` / `req.user.msisdn` / `req.user.phoneNumber` /
-`req.user.mobileNumber`. The phone number is normalized (formatting
-characters stripped) and validated as phone-shaped before being attached to
-`context.msisdn` — anything that doesn't look like a real number is dropped
-rather than forwarded. Both are stored as their own indexed columns on the
-backend (not just inside the JSON context blob), so per-user and
-per-phone-number filtering and trend graphs don't require parsing JSON per
-row.
+That's the whole setup. Everything below documents what each piece does and
+how to go further — manual capture, catching swallowed errors, breadcrumbs,
+logger integrations, and the zero-code Babel plugin.
 
-**App version.** The `X-APP-VERSION` header (whatever version string your
-client sends) is captured into `context.appVersion` — no format validation,
-since version strings vary (semver, build numbers, etc.), just trimmed and
-length-capped. Useful for spotting version-specific regressions ("only
-v2.3.0 clients hit this").
+---
+
+## Configuration Reference
+
+Options passed to `new VantaTrace({ ... })`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `apiKey` | `string` | — | **Required.** Your VantaTrace project API key. If omitted, the SDK runs in dry-run mode (logs what it *would* send when `debug: true`, sends nothing). |
+| `serviceName` | `string` | — | Logical service name attached to every event — how you tell microservices apart on the dashboard. |
+| `apiUrl` | `string` | `https://api.vantatrace.com/api/events` | Override the ingestion endpoint (self-hosted/enterprise deployments). |
+| `debug` | `boolean` | `false` | Logs SDK internals to the console — capture attempts, batch sends, retries, disabled-key state. |
+| `autoCapture.http5xx` | `boolean` | `true` | Emit a synthetic error when a request finishes 5xx with no exception reported (see [4a](#automatic-capture-of-trycatch-errors)). |
+| `autoCapture.caughtExceptions` | `boolean \| CaughtExceptionCaptureOptions` | `false` | Opt-in V8-inspector watcher that recovers the *real* error object from inside `try/catch` blocks (see [4b](#automatic-capture-of-trycatch-errors)). |
+| `autoCapture.caughtExceptions.report` | `'request-failure' \| 'always'` | `'request-failure'` | Whether caught exceptions are only reported when the request ultimately fails, or always. |
+| `autoCapture.caughtExceptions.includeNodeModules` | `boolean` | `false` | Also capture exceptions thrown from inside `node_modules`. |
+| `autoCapture.caughtExceptions.maxPerMinute` | `number` | `120` | Ceiling on recorded caught exceptions per minute, to protect throw-heavy hot paths. |
+
+---
+
+## Express Integration
+
+### Automatic Context Enrichment
+
+`requestHandler()` populates the active request's context automatically —
+none of this requires a manual `captureException()` call; it's merged into
+every error captured while the request is in flight.
+
+| Field | Source |
+| --- | --- |
+| `userId` | `req.user.id` → `req.user._id` → `req.user.userId` → `req.userId`, in that order — whichever auth middleware you use, as long as it runs **before** `requestHandler()`. |
+| `user` | `{ id, email, role, tenantId, orgId }`, pulled off `req.user` when it's an object. |
+| `msisdn` | `X-MSISDN` header, or `req.user.phone` / `mobilephone` / `msisdn` / `phoneNumber` / `mobileNumber`. Normalized to digits + optional leading `+`, and validated as phone-shaped (7–15 digits) — anything that doesn't look like a real number is dropped rather than forwarded. |
+| `appVersion` | `X-APP-VERSION` header, trimmed and capped at 64 characters. Powers release tracking on the dashboard. |
+| `route` / `method` | `req.route.path` / `req.path` / `req.url`, and `req.method`. |
+| `ip` / `geo` | `req.ip`, `X-Forwarded-For`, or the socket's remote address; country/region/city from common CDN headers (`CF-IPCountry`, `X-GeoIP-*`, etc.) if your edge/proxy sets them. |
+| `headers` | The full request header set, with sensitive headers redacted (see [Security](#security--data-redaction)). |
+| `body` / `query` | The parsed request body and query string, with sensitive keys redacted. |
+| `sessionId` | `req.sessionID`, `req.session.id`, or `X-Session-Id`. |
+| `correlationId` | `X-Correlation-Id`, `X-Request-Id`, or `X-Trace-Id`. |
+| `featureFlags` | `req.featureFlags` / `req.flags` / `req.experiments`, if your app sets one of these. |
+| `duration` | Milliseconds elapsed between `requestHandler()` running and the error being captured. |
+
+> [!IMPORTANT]
+> **`userId` is auto-extracted, not a header.** Unlike `appVersion`, there is
+> no `X-USER-ID` header fallback — the SDK only ever reads `req.user.*` /
+> `req.userId`. This only works if **your own auth middleware runs before
+> `vantaTrace.requestHandler()`** in the middleware chain and actually sets
+> `req.user` (or `req.userId`). If your auth middleware runs after
+> `requestHandler()`, or you don't use `req.user` at all, every captured
+> event will have **no `userId`**, and per-user filtering/dashboards on the
+> backend will simply be empty — VantaTrace has no other way to know who hit
+> the error. If auto-extraction doesn't fit your setup, pass it explicitly
+> per call instead: `captureException(error, { userId })` — this always
+> takes precedence over whatever was auto-extracted.
+
+> [!IMPORTANT]
+> **`appVersion` is auto-extracted from the inbound `X-APP-VERSION` request
+> header — VantaTrace does not compute or guess it.** It's populated purely
+> from whatever your client (browser/mobile app) sends on the request that
+> triggered the error. **If your client never sends an `X-APP-VERSION`
+> header, no release will be attached to that event**, and it won't appear
+> under any release in the dashboard's release tracking view. Make sure the
+> client you're instrumenting sends its own build/app version in that header
+> on every request for release tracking to work. Like `userId`, you can also
+> set it explicitly per call via `captureException(error, { appVersion:
+> '2.3.1' })` if you'd rather not rely on the header.
 
 **Headers carrying secrets are always redacted, never captured.** Any header
 whose name looks like it carries a secret — `Authorization`, `Cookie`,
 `X-Api-Key`, and (importantly) **`X-MPIN`** — is replaced with `[REDACTED]`
 in `context.headers` before the event ever leaves `requestHandler()`. This
-uses the same substring check as body/query redaction (`password`, `token`,
-`secret`, `auth`, `pin`, `creditcard`, `cvv`, `cookie`, `api-key`), so an MPIN
-sent as a header is never stored, logged, or forwarded in any form —
-independent of the backend's own defense-in-depth scrubbing.
+uses the same substring check as body/query redaction, so an MPIN sent as a
+header is never stored, logged, or forwarded in any form — independent of
+the backend's own defense-in-depth scrubbing.
 
-------------------------------------------------------------------------
+---
 
-### 4. Automatic Capture of Errors Handled in try/catch (Runtime)
+## Manual Error Capturing
+
+```javascript
+try {
+  await processOrder();
+} catch (error) {
+  vantaTrace.captureException(error, {
+    userId: 'user_8872',
+    route: '/api/v1/orders',
+    method: 'POST',
+    severity: 'warning',
+    metadata: {
+      orderId: 'ord_128d9a',
+      amount: 149.5
+    }
+  });
+}
+```
+
+Severity shortcuts are also available:
+
+```javascript
+vantaTrace.captureCritical(error);
+vantaTrace.captureWarning(error);
+vantaTrace.captureInfo(error);
+```
+
+Any field on `VantaTraceContext` can be passed to `captureException()` (or
+the severity helpers) to override or supplement whatever was
+auto-extracted from the active request:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `userId` | `string` | Overrides the auto-extracted user ID. |
+| `user` | `{ id, email, role, tenantId, orgId }` | Structured user info. |
+| `route` / `method` | `string` | Overrides the auto-extracted route/method — useful outside Express (queue consumers, cron jobs). |
+| `ip`, `geo`, `headers`, `body`, `query` | — | Same shape as the auto-extracted fields. |
+| `msisdn` / `appVersion` | `string` | Explicit overrides for phone number / release version. |
+| `sessionId` / `correlationId` | `string` | Explicit correlation identifiers. |
+| `duration` | `number` | Milliseconds, if you want to report your own timing. |
+| `featureFlags` | `Record<string, any>` | Arbitrary flag state active during the error. |
+| `metadata` | `Record<string, any>` | Free-form custom data — merged with any metadata already on the active request context. |
+| `severity` | `'critical' \| 'warning' \| 'info'` | Defaults to `'critical'` if unset. |
+| `breadcrumbs` | `Breadcrumb[]` | Rarely set manually — see [Breadcrumbs](#breadcrumbs). |
+
+### Error Context & Root Cause Chains
+
+VantaTrace automatically extracts and normalizes the following properties
+directly from your captured `Error` objects:
+
+- **`code`** — system or custom error codes (e.g. `ENOENT`, `ECONNREFUSED`).
+- **`statusCode`** — HTTP response status codes (e.g. `404`, `500`), read from either `.statusCode` or `.status`.
+- **`extra`** — any custom properties attached to the Error instance at throw-time (e.g. `error.userId = 'user_1'`).
+- **`cause` (nested cause chains)** — if your errors use the native `Error.cause` option, VantaTrace recursively walks the entire chain (up to 5 levels deep, with circular-reference protection) and normalizes it.
+
+```javascript
+try {
+  try {
+    throw new Error('Database connection failed', { cause: new Error('Socket timeout') });
+  } catch (dbErr) {
+    throw new Error('Failed to checkout order', { cause: dbErr });
+  }
+} catch (error) {
+  vantaTrace.captureException(error); // captures: Order error -> DB error -> Socket timeout
+}
+```
+
+On the dashboard, the entire root-cause chain is rendered as an interactive
+visual timeline directly under the main stack trace block.
+
+---
+
+## Automatic Capture of try/catch Errors
 
 Errors handled inside a local `try/catch` never reach the error middleware:
 
-``` javascript
+```javascript
 app.get('/api/v1/check', (req, res) => {
   try {
     a; // ReferenceError
@@ -143,18 +317,18 @@ app.get('/api/v1/check', (req, res) => {
 });
 ```
 
-VantaTrace captures these automatically — no `captureException()` call and no
-per-catch-block changes required — through two layers:
+VantaTrace captures these automatically — no `captureException()` call and
+no per-catch-block changes required — through two layers:
 
-#### 4a. Failed-request safety net (enabled by default)
+### 4a. Failed-request safety net (enabled by default)
 
-When a request finishes with a **5xx status** and no error was reported for it,
-the SDK emits a synthetic `HttpServerError` event carrying the method, route,
-status code, and full request context (`metadata.captureStrategy: 'http5xx'`).
-The failure becomes visible on the dashboard even though the original error
-object was swallowed. Disable with:
+When a request finishes with a **5xx status** and no error was reported for
+it, the SDK emits a synthetic `HttpServerError` event carrying the method,
+route, status code, and full request context
+(`metadata.captureStrategy: 'http5xx'`). The failure becomes visible on the
+dashboard even though the original error object was swallowed. Disable with:
 
-``` javascript
+```javascript
 new VantaTrace({ apiKey, autoCapture: { http5xx: false } });
 ```
 
@@ -169,7 +343,7 @@ Two things make this safety net more useful without any extra config:
   4b below (or the Babel plugin) so the fix is discoverable from the
   dashboard itself, not just this README.
 
-#### 4b. Deep capture via the V8 inspector (opt-in)
+### 4b. Deep capture via the V8 inspector (opt-in)
 
 JavaScript has no language-level hook for caught exceptions — `try/catch` is
 resolved entirely inside the V8 VM (this is why Sentry and Bugsnag require
@@ -180,7 +354,7 @@ before the catch block runs** — including engine-generated errors like
 `ReferenceError` and `TypeError`. VantaTrace uses this to recover the *real*
 error object with its full stack trace and request context:
 
-``` javascript
+```javascript
 const vantaTrace = new VantaTrace({
   apiKey: 'YOUR_API_KEY',
   autoCapture: {
@@ -197,7 +371,7 @@ code — automatically.
 default the SDK buffers them per request and reports only when the request
 actually fails:
 
-``` javascript
+```javascript
 autoCapture: {
   caughtExceptions: {
     report: 'request-failure', // default: report only if the request ends >= 500
@@ -216,72 +390,30 @@ autoCapture: {
   consumers, cron jobs).
 
 Duplicates are automatically suppressed: an error that is caught, rethrown,
-and then reaches `errorHandler()` (or a manual `captureException`) is reported
-exactly once.
+and then reaches `errorHandler()` (or a manual `captureException`) is
+reported exactly once.
 
-**Performance.** Near-zero overhead while nothing throws; roughly **0.3–0.5ms
-per thrown exception** while enabled (measured on Node 22). That is negligible
-when exceptions are exceptional, but measurable for code that uses throw/catch
-as control flow — which is why this layer is opt-in, the same trade-off Sentry
-documents for its `captureAllExceptions` local-variables mode. For
-zero-runtime-overhead capture, use the Babel plugin (next section) instead.
+> [!WARNING]
+> Enabling `autoCapture.caughtExceptions` in production logs a one-time
+> console warning: it's a real operational trade-off, not a free feature.
+> The V8 inspector watcher adds roughly **0.3–0.5ms per thrown exception**
+> while enabled (near-zero when nothing throws) — negligible when exceptions
+> are exceptional, but measurable for code that uses throw/catch as control
+> flow. For zero-runtime-overhead capture, use the
+> [Babel plugin](#zero-code-auto-capture-babel-plugin) instead.
 
 Call `vantaTrace.shutdown()` on graceful shutdown to detach the inspector
 session (optional; safe to call multiple times).
 
-------------------------------------------------------------------------
+---
 
-### 5. Manual Error Capturing
+## Zero-Code Auto-Capture (Babel Plugin)
 
-``` javascript
-try {
-  await processOrder();
-} catch (error) {
-  vantaTrace.captureException(error, {
-    userId: 'user_8872',
-    route: '/api/v1/orders',
-    method: 'POST',
-    severity: 'warning',
-    metadata: {
-      orderId: 'ord_128d9a',
-      amount: 149.5
-    }
-  });
-}
-```
-
-### 5a. Error Context & Root Cause Chains
-
-VantaTrace automatically extracts and normalizes the following properties directly from your captured Error objects:
-- **`code`**: System or custom error codes (e.g. `ENOENT`, `ECONNREFUSED`).
-- **`statusCode`**: HTTP response status codes (e.g. `404`, `500`).
-- **`extra`**: Any custom properties attached to the Error instance at throw-time (e.g. `error.userId = 'user_1'`).
-- **`cause` (Nested Cause Chains)**: If your errors utilize the native `Error.cause` option, VantaTrace recursively walks the entire chain and normalizes it.
-
-Example of nested cause chains:
-``` javascript
-try {
-  try {
-    throw new Error('Database connection failed', { cause: new Error('Socket timeout') });
-  } catch (dbErr) {
-    throw new Error('Failed to checkout order', { cause: dbErr });
-  }
-} catch (error) {
-  vantaTrace.captureException(error); // captures: Order error -> DB error -> Socket timeout
-}
-```
-
-On the dashboard, the entire root-cause chain is rendered as an interactive visual timeline directly under the main stack trace block.
-
-------------------------------------------------------------------------
-
-### 6. Zero-Code Auto-Capture (Babel Plugin)
-
-VantaTrace includes a Babel plugin that automatically injects an error capture
-call into every `try/catch` block in your codebase at build time — no manual
-`vantaTrace.captureException()` calls required, and no per-file imports to
-remember. It resolves to whichever `VantaTrace` instance you constructed in
-your entrypoint (see step 1) automatically.
+VantaTrace includes a Babel plugin that automatically injects an error
+capture call into every `try/catch` block in your codebase at build time —
+no manual `vantaTrace.captureException()` calls required, and no per-file
+imports to remember. It resolves to whichever `VantaTrace` instance you
+constructed in your entrypoint (see Quick Start) automatically.
 
 **Setup in `.babelrc` or `babel.config.js`:**
 
@@ -293,13 +425,14 @@ your entrypoint (see step 1) automatically.
 ```
 
 > [!NOTE]
-> The plugin auto-imports its runtime helper as an ESM `import` or a CommonJS
-> `require()` depending on Babel's detected `sourceType` for each file. A module
-> transform like `@babel/preset-env` (or setting `sourceType: "unambiguous"`) makes
-> sure that import is correctly compiled down for CommonJS codebases — without one,
-> a plain CommonJS file with no `import`/`export` syntax will otherwise get an ESM
-> `import` injected into it and fail at runtime with `SyntaxError: Cannot use import
-> statement outside a module`.
+> The plugin auto-imports its runtime helper as an ESM `import` or a
+> CommonJS `require()` depending on Babel's detected `sourceType` for each
+> file. A module transform like `@babel/preset-env` (or setting
+> `sourceType: "unambiguous"`) makes sure that import is correctly compiled
+> down for CommonJS codebases — without one, a plain CommonJS file with no
+> `import`/`export` syntax will otherwise get an ESM `import` injected into
+> it and fail at runtime with `SyntaxError: Cannot use import statement
+> outside a module`.
 
 **Next.js (`next.config.js`):**
 
@@ -313,13 +446,12 @@ module.exports = {
 };
 ```
 
-Next.js defaults to its SWC compiler, but auto-detects a `.babelrc`/`babel.config.js`
-in your project root and switches that project to the Babel pipeline — no extra
-flags needed.
+Next.js defaults to its SWC compiler, but auto-detects a
+`.babelrc`/`babel.config.js` in your project root and switches that project
+to the Babel pipeline — no extra flags needed.
 
-**How it works:**
+**How it works.** It transforms this:
 
-It transforms this:
 ```javascript
 try {
   doSomething();
@@ -329,6 +461,7 @@ try {
 ```
 
 Into this:
+
 ```javascript
 import { captureExceptionGlobal } from '@vantatrace/sdk/runtime';
 // ...
@@ -340,16 +473,17 @@ try {
 }
 ```
 
-(In CommonJS files, it injects an equivalent `require('@vantatrace/sdk/runtime')`
-instead of an `import`.)
+(In CommonJS files, it injects an equivalent
+`require('@vantatrace/sdk/runtime')` instead of an `import`.)
 
 **Skip rules — the plugin will NOT inject a capture call when:**
+
 - The catch block has no binding: `catch { ... }`.
 - The catch binding is destructured: `catch ({ message }) { ... }`.
-- `captureException`/`captureExceptionGlobal` is already called manually within
-  that same catch block.
-- A `// vantatrace-ignore` comment appears above the `try`, above the `catch`,
-  or inline on the `catch (err) {` line:
+- `captureException`/`captureExceptionGlobal` is already called manually
+  within that same catch block.
+- A `// vantatrace-ignore` comment appears above the `try`, above the
+  `catch`, or inline on the `catch (err) {` line:
   ```javascript
   try {
     doSomething();
@@ -358,42 +492,257 @@ instead of an `import`.)
   }
   ```
 
-------------------------------------------------------------------------
+> [!NOTE]
+> The injected `captureExceptionGlobal()` call resolves to whichever
+> `VantaTrace` instance registered first in the process (see
+> [Multiple Instances](#multiple-instances--microservices)) — if no instance
+> has been constructed yet when a Babel-instrumented catch block runs, the
+> call is a one-time-warned no-op rather than a crash.
 
-## ⚙️ Severity Levels
+---
 
-``` javascript
-vantaTrace.captureCritical(error);
-vantaTrace.captureWarning(error);
-vantaTrace.captureInfo(error);
+## Breadcrumbs
+
+Breadcrumbs are a lightweight timeline of events leading up to an error —
+shown on the dashboard directly above the stack trace. VantaTrace records
+two kinds automatically, and exposes a manual API for your own:
+
+- **Console breadcrumbs.** Once `initGlobalHandlers()` is called, every
+  `console.log` / `console.info` / `console.warn` / `console.error` call
+  in your app is recorded as a breadcrumb (capped at the last 50 per
+  request). An `Error` instance passed to `console.error(...)` is also
+  captured as a real exception, not just a breadcrumb.
+- **Outbound HTTP breadcrumbs.** Every outgoing `http`/`https` request your
+  app makes (via Node's built-in modules, which most HTTP clients use
+  under the hood) is recorded as a breadcrumb with its method and URL —
+  useful for seeing "we called the payment gateway, then it failed." Calls
+  to VantaTrace's own ingestion endpoint are excluded so they don't spam
+  the trail. This is always on — no `initGlobalHandlers()` call needed.
+
+**Manual breadcrumbs:**
+
+```javascript
+vantaTrace.addBreadcrumb({
+  category: 'checkout',
+  message: 'Applied discount code SUMMER25',
+  level: 'info',
+  type: 'business-logic',
+  data: { discountCode: 'SUMMER25', amount: 12.5 }
+});
 ```
 
-------------------------------------------------------------------------
+Breadcrumbs are scoped to the active request (via `AsyncLocalStorage`) and
+capped at 50 per request — the oldest is dropped once the cap is reached, so
+memory use per request stays bounded regardless of how chatty a request is.
 
-## 🧠 How It Works
+---
 
-Application Error → SDK Capture → Context Enrichment → Fingerprinting →
-Async Queue → Ingestion API → Dashboard
+## Logger Integrations (Winston / Pino)
 
-------------------------------------------------------------------------
+Calling `initGlobalHandlers()` also auto-patches Winston and Pino, if either
+is installed in your project — no extra transport wiring required:
 
-## 🔒 Security
+- **Winston** — VantaTrace registers itself as an additional transport.
+  Any log entry that is (or carries) an `Error` — `logger.error(err)`,
+  `logger.error('msg', { err })`, `logger.error('msg', { error: err })` — is
+  captured, with Winston's log level mapped to VantaTrace severity
+  (`error` → `critical`, `warn` → `warning`, everything else → `info`).
+- **Pino** — the same detection runs against Pino's internal `write` call.
+  An `Error` passed directly, or under an `err`/`error` key, is captured the
+  same way.
 
-Sensitive fields are automatically redacted: password, token, secret,
-authorization, cookie, api-key, pin/mpin, credit card, cvv — in the request
-body, the query string, and HTTP headers alike (so an `X-MPIN` header is
-redacted the same way a `password` body field is).
+Both integrations are **fail-silent**: if the package isn't installed,
+detection throws internally and is caught — nothing breaks, and nothing is
+patched. Neither library is a dependency of `@vantatrace/sdk`; install
+whichever one your project already uses and VantaTrace will find it.
 
-------------------------------------------------------------------------
+---
 
-## ⚡ Performance
+## Trace IDs & Log Correlation
 
--   \<1ms overhead
--   Async non-blocking execution
--   Batched ingestion
+Every error VantaTrace captures carries a `traceId` — a per-request
+identifier generated the first time an error is captured within that
+request's `AsyncLocalStorage` scope, and reused for every subsequent error
+in the same request. This is what lets the dashboard show "these 3 error
+events all came from the same request."
 
-------------------------------------------------------------------------
+You can stamp the same ID onto your own application logs so a VantaTrace
+event and the surrounding log lines can be correlated later:
 
-## 📊 Architecture
+```javascript
+import { VantaTrace } from '@vantatrace/sdk';
 
-Microservice → SDK → Ingestion API → Fingerprinting Engine → Dashboard
+logger.info('Processing checkout', {
+  traceId: VantaTrace.getActiveTraceId() // undefined outside an active request
+});
+```
+
+`getActiveTraceId()` is a static method — call it as `VantaTrace.getActiveTraceId()`,
+not on an instance.
+
+---
+
+## Global Process Handlers
+
+`vantaTrace.initGlobalHandlers()` wires up three independent capture systems
+in one call:
+
+1. **`uncaughtException`** — native/runtime errors that escape every catch
+   block (typos, undefined references). VantaTrace captures the error, then
+   gives the batched transport ~1.5 seconds to flush before the process
+   exits (Node's own crash-recovery behavior for uncaught exceptions is
+   otherwise immediate).
+2. **`unhandledRejection`** — async/await errors that are thrown or
+   generated inside an async catch block and never awaited/caught further
+   up. Non-`Error` rejection reasons are wrapped in an `Error` before
+   capture.
+3. **Logger interception** — `console.error`/`log`/`warn`/`info` (see
+   [Breadcrumbs](#breadcrumbs)), plus [Winston and Pino](#logger-integrations-winston--pino)
+   if installed.
+
+All three share the same deduplication guard as `captureException()`, so an
+error that reaches multiple handlers (e.g. logged via `console.error` and
+then rethrown to `uncaughtException`) is only ever reported once.
+
+---
+
+## Security & Data Redaction
+
+Sensitive fields are automatically redacted — in the request body, the query
+string, and HTTP headers alike — using a case-insensitive substring match
+against the field/header name:
+
+```
+password · token · secret · auth (matches authorization, proxy-authorization)
+pin (matches mpin, x-mpin) · creditcard · cvv · cookie (matches set-cookie)
+api-key (matches x-api-key)
+```
+
+A field or header matching any of these is replaced with `[REDACTED]` before
+the event ever leaves your process — this happens in `requestHandler()`
+itself, independent of any additional scrubbing your VantaTrace backend
+applies as defense-in-depth. This is why an `X-MPIN` header is redacted the
+same way a `password` body field is.
+
+---
+
+## Performance, Reliability & Internals
+
+VantaTrace is built to disappear under normal operation and degrade
+gracefully under load, rather than add risk to your app:
+
+- **Batched, non-blocking transport.** Captured events are queued per
+  (API URL, API key) and flushed as a single HTTP request: immediately for
+  `critical` severity or once a batch reaches 50 events, otherwise on a
+  500ms timer. Sending happens via `setImmediate`, deferred out of the
+  current event-loop turn.
+- **Compression.** Batches larger than 10KB are gzipped before sending
+  (falls back to plaintext if compression fails for any reason).
+- **Connection reuse.** Keep-alive HTTP/HTTPS agents pool TCP/TLS
+  connections, and a 30-second in-memory DNS cache avoids repeated lookups
+  — both reduce per-request overhead for high-frequency error reporting.
+- **Retry.** A failed batch send is retried once before being dropped.
+- **Backpressure.** A soft ceiling (50 concurrent in-flight batches) drops
+  non-critical events; a hard ceiling (100) drops everything, protecting
+  your process from unbounded memory growth if the ingestion endpoint is
+  unreachable for an extended period.
+- **Automatic kill-switch.** If the backend reports your API key as
+  disabled (HTTP 403, or an explicit disabled flag), the SDK stops sending
+  for 5 minutes before re-checking — no wasted retries against a key you've
+  intentionally revoked.
+- **Fingerprinting.** Errors are grouped by an MD5 hash of their name,
+  message, and the first 4 lines of their normalized stack trace — enough
+  to ignore incidental line-number drift deep in library code while still
+  treating genuinely different call sites as separate issues.
+- **Lightweight system telemetry.** CPU/memory/load-average snapshots are
+  sampled on a background 10-second timer (`.unref()`'d, so it never keeps
+  your process alive on its own) rather than queried synchronously on every
+  captured error.
+
+---
+
+## TypeScript Support
+
+The SDK is written in TypeScript and ships compiled `.d.ts` declarations —
+`VantaTrace`'s public methods are fully typed, including `captureException`'s
+context parameter (`VantaTraceContext`).
+
+You don't need to import that type explicitly to get type-checking: passing
+an inline object literal is checked structurally against the method
+signature either way —
+
+```typescript
+vantaTrace.captureException(error, {
+  userId: 'user_123',
+  severity: 'warning' // typo here (e.g. 'warn') is a compile error
+});
+```
+
+— which covers the overwhelming majority of real usage.
+
+---
+
+## API Reference
+
+| Method | Description |
+| --- | --- |
+| `new VantaTrace(options)` | Construct an instance. See [Configuration Reference](#configuration-reference). |
+| `.captureException(error, context?)` | Capture an error with optional context overrides. Default severity: `critical`. |
+| `.captureCritical(error, context?)` | Shortcut for `captureException(error, { ...context, severity: 'critical' })`. |
+| `.captureWarning(error, context?)` | Shortcut for `severity: 'warning'`. |
+| `.captureInfo(error, context?)` | Shortcut for `severity: 'info'`. |
+| `.requestHandler()` | Express middleware — mount first, establishes per-request context. |
+| `.errorHandler()` | Express middleware — mount last, captures unhandled route errors. |
+| `.expressMiddleware()` | **Deprecated.** Alias for `.errorHandler()`. |
+| `.initGlobalHandlers()` | Wires up `uncaughtException`, `unhandledRejection`, and logger interception. See [Global Process Handlers](#global-process-handlers). |
+| `.addBreadcrumb(breadcrumb)` | Record a manual breadcrumb on the active request. See [Breadcrumbs](#breadcrumbs). |
+| `.shutdown()` | Detaches the V8 inspector watcher (if `autoCapture.caughtExceptions` was enabled). Safe to call multiple times. |
+| `VantaTrace.getActiveTraceId()` | **Static.** Returns the active request's trace ID, or `undefined` outside a request. See [Trace IDs](#trace-ids--log-correlation). |
+
+---
+
+## Multiple Instances / Microservices
+
+Construct one `VantaTrace` instance per process — typically once, in your
+entrypoint — and reuse it everywhere in that service via your own module
+export or dependency injection. For a fleet of microservices, give each
+service its own project API key (or the same key with a different
+`serviceName`) and its own instance.
+
+> [!NOTE]
+> The [Babel plugin](#zero-code-auto-capture-babel-plugin)'s injected
+> `captureExceptionGlobal()` calls resolve to a single process-wide
+> singleton: **the first `VantaTrace` instance constructed wins.**
+> Constructing a second instance in the same process logs a warning and
+> does not replace the registered singleton — direct `vantaTrace.captureException()`
+> calls on that second instance still work normally, only the
+> Babel-injected auto-capture is affected.
+
+---
+
+## Troubleshooting
+
+**No events showing up on the dashboard?**
+- Confirm `apiKey` is set and correct — with no key, the SDK silently runs
+  in dry-run mode (set `debug: true` to see what it would have sent).
+- Check for a "API key is temporarily disabled" debug log — see the
+  kill-switch note in [Performance, Reliability & Internals](#performance-reliability--internals).
+- If you're relying on `autoCapture.http5xx`/`caughtExceptions` for errors
+  swallowed by a `try/catch`, confirm the request actually returned 5xx —
+  the safety net only fires for failed requests by default.
+
+**`userId`/`appVersion` always empty?** See the callouts under
+[Automatic Context Enrichment](#automatic-context-enrichment) — both are
+extracted from the incoming request (auth middleware / `X-APP-VERSION`
+header respectively), not inferred by VantaTrace.
+
+**`SyntaxError: Cannot use import statement outside a module` after adding
+the Babel plugin?** See the note under
+[Zero-Code Auto-Capture](#zero-code-auto-capture-babel-plugin) — add a
+module transform (`@babel/preset-env`) or set `sourceType: "unambiguous"`.
+
+---
+
+## License
+
+MIT
