@@ -112,11 +112,41 @@ backend (not just inside the JSON context blob), so per-user and
 per-phone-number filtering and trend graphs don't require parsing JSON per
 row.
 
-**App version.** The `X-APP-VERSION` header (whatever version string your
-client sends) is captured into `context.appVersion` — no format validation,
+> [!IMPORTANT]
+> **`userId` is auto-extracted, not a header.** Unlike `appVersion` below,
+> there is no `X-USER-ID` header fallback — the SDK only ever reads
+> `req.user.*` / `req.userId`. This only works if **your own auth middleware
+> runs before `vantaTrace.requestHandler()`** in the middleware chain and
+> actually sets `req.user` (or `req.userId`). If your auth middleware runs
+> after `requestHandler()`, or you don't use `req.user` at all, every
+> captured event will have **no `userId`**, and per-user filtering/dashboards
+> on the backend will simply be empty — VantaTrace has no other way to know
+> who hit the error. If auto-extraction doesn't fit your setup, pass it
+> explicitly per call instead: `captureException(error, { userId })` (see
+> [Manual Error Capturing](#5-manual-error-capturing)) — this always takes
+> precedence over whatever was auto-extracted.
+
+**App version — this is what powers release tracking on the dashboard.**
+The `X-APP-VERSION` header (whatever version string your client sends, e.g.
+`2.3.1` or a build number) is captured into `context.appVersion`, stored per
+event, and is exactly what the backend's `/dashboard/releases` endpoints
+group by to show error rate by release and flag which release a regression
+was first seen in ("this issue started in v2.3.1"). No format validation,
 since version strings vary (semver, build numbers, etc.), just trimmed and
-length-capped. Useful for spotting version-specific regressions ("only
-v2.3.0 clients hit this").
+length-capped.
+
+> [!IMPORTANT]
+> **`appVersion` is auto-extracted from the inbound `X-APP-VERSION` request
+> header — VantaTrace does not compute or guess it.** It is populated purely
+> from whatever your client (browser/mobile app) sends on the request that
+> triggered the error. **If your client never sends an `X-APP-VERSION`
+> header, no release will be attached to that event**, and it won't appear
+> under any release in the dashboard's release tracking view. Make sure the
+> app/client you're instrumenting is configured to send its own build/app
+> version in that header on every request for release tracking to work.
+> Like `userId`, you can also set it explicitly per call via
+> `captureException(error, { appVersion: '2.3.1' })` if you'd rather not rely
+> on the header.
 
 **Headers carrying secrets are always redacted, never captured.** Any header
 whose name looks like it carries a secret — `Authorization`, `Cookie`,
