@@ -64,6 +64,22 @@ function extractCauseChain(err: any): NormalizedCause[] | undefined {
   return chain.length > 0 ? chain : undefined;
 }
 
+function safeStringify(val: any, maxLength = 2048): string {
+  try {
+    const seen = new WeakSet();
+    const str = JSON.stringify(val, (key, value) => {
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) return '[CIRCULAR]';
+        seen.add(value);
+      }
+      return value;
+    });
+    return str.length > maxLength ? `${str.slice(0, maxLength)}...[TRUNCATED]` : str;
+  } catch (_e) {
+    return String(val);
+  }
+}
+
 export function normalizeError(err: any): {
   name: string;
   message: string;
@@ -102,7 +118,7 @@ export function normalizeError(err: any): {
     stack = new Error(err).stack || '';
   } else if (err && typeof err === 'object') {
     name = err.name || err.constructor?.name || 'Error';
-    message = err.message || JSON.stringify(err);
+    message = err.message || safeStringify(err);
     stack = err.stack || new Error(message).stack || '';
 
     if ('code' in err) code = String(err.code);

@@ -117,7 +117,7 @@ export class VantaTrace {
    * Links Winston/Pino log entries with the same VantaTrace error event on the dashboard.
    */
   private _generateTraceId(): string {
-    return crypto.randomBytes(16).toString('hex');
+    return crypto.randomUUID().replace(/-/g, '');
   }
 
   /**

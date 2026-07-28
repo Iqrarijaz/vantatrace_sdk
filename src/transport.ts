@@ -3,7 +3,19 @@ import * as https from 'https';
 import { URL } from 'url';
 import * as dns from 'dns';
 import * as zlib from 'zlib';
+import * as crypto from 'crypto';
 import { ErrorPayload } from './types';
+
+// Pre-computed SHA-256 hash cache to avoid re-hashing on every send
+const apiKeyHashCache = new Map<string, string>();
+function getApiKeyHash(apiKey: string): string {
+  let hash = apiKeyHashCache.get(apiKey);
+  if (!hash) {
+    hash = crypto.createHash('sha256').update(apiKey).digest('hex');
+    apiKeyHashCache.set(apiKey, hash);
+  }
+  return hash;
+}
 
 // Keep-alive agents to enable connection pooling and reuse TCP/TLS sockets
 const httpKeepAliveAgent = new http.Agent({
@@ -63,7 +75,22 @@ const queues = new Map<string, {
   timer: NodeJS.Timeout | null;
 }>();
 
-const disabledKeys = new Set<string>();
+const disabledKeys = new Map<string, number>();
+const DISABLED_KEY_TTL_MS = 5 * 60 * 1000; // Re-check disabled status after 5 minutes
+
+function isKeyDisabled(apiKey: string): boolean {
+  const expiry = disabledKeys.get(apiKey);
+  if (!expiry) return false;
+  if (Date.now() > expiry) {
+    disabledKeys.delete(apiKey);
+    return false;
+  }
+  return true;
+}
+
+function markKeyDisabled(apiKey: string): void {
+  disabledKeys.set(apiKey, Date.now() + DISABLED_KEY_TTL_MS);
+}
 
 // Concurrent connection tracking for backpressure management
 let pendingRequestsCount = 0;
@@ -80,9 +107,9 @@ export function sendPayload(
   payload: ErrorPayload,
   debug: boolean = false
 ): void {
-  if (disabledKeys.has(apiKey)) {
+  if (isKeyDisabled(apiKey)) {
     if (debug) {
-      console.log(`[VantaTrace] Event skipped: API Key is disabled.`);
+      console.log(`[VantaTrace] Event skipped: API Key is temporarily disabled.`);
     }
     return;
   }
@@ -139,6 +166,22 @@ export function sendPayload(
 }
 
 /**
+ * Flush all pending queued error batches immediately across all API key buckets.
+ */
+export function flushAllQueues(): void {
+  for (const queue of queues.values()) {
+    if (queue.timer) {
+      clearTimeout(queue.timer);
+      queue.timer = null;
+    }
+    const batch = queue.entries.splice(0, queue.entries.length);
+    if (batch.length > 0) {
+      sendBatch(queue.apiUrl, queue.apiKey, batch, queue.debug);
+    }
+  }
+}
+
+/**
  * Make the HTTP/HTTPS request using connection pooling to send a batch of events.
  */
 function sendBatch(
@@ -188,6 +231,7 @@ function sendBatch(
             'Content-Type': 'application/json',
             'Content-Length': bodyData.length,
             'x-api-key': apiKey,
+            'x-api-key-hash': getApiKeyHash(apiKey),
             ...(isCompressed ? { 'Content-Encoding': 'gzip' } : {})
           },
           timeout: 2000, // 2-second timeout for batches
@@ -211,14 +255,14 @@ function sendBatch(
               logDebug(`Failed to send batch of events. Status: ${res.statusCode}`);
               if (res.statusCode === 403 || res.headers['x-vantatrace-disabled'] === 'true') {
                 logDebug(`API key ${apiKey} is disabled. Skipping subsequent calls.`);
-                disabledKeys.add(apiKey);
+                markKeyDisabled(apiKey);
                 return;
               }
               try {
                 const parsed = JSON.parse(responseBody);
                 if (parsed.disabled === true) {
                   logDebug(`API key ${apiKey} is disabled. Skipping subsequent calls.`);
-                  disabledKeys.add(apiKey);
+                  markKeyDisabled(apiKey);
                   return;
                 }
               } catch (_) {}
