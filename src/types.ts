@@ -44,8 +44,6 @@ export interface VantaTraceOptions {
   apiKey: string;
   debug?: boolean;
   apiUrl?: string;
-  /** Logical service name attached to every event (shown on the dashboard). */
-  serviceName?: string;
   /** Automatic error-capture behaviors that go beyond the Express error middleware. */
   autoCapture?: AutoCaptureOptions;
 }
@@ -108,7 +106,6 @@ export interface NormalizedCause {
 
 export interface ErrorPayload {
   apiKey: string;
-  serviceName?: string;
   timestamp: string;
   /** Unique trace ID generated per capture — links Winston / logger entries with the same error event. */
   traceId: string;

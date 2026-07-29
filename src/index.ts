@@ -16,7 +16,6 @@ export class VantaTrace {
   private apiKey: string;
   private debug: boolean;
   private apiUrl: string;
-  private serviceName?: string;
   // Auto-capture configuration (resolved from options.autoCapture)
   private http5xxEnabled: boolean;
   private caughtReportPolicy: 'request-failure' | 'always';
@@ -54,7 +53,6 @@ export class VantaTrace {
   constructor(options: VantaTraceOptions) {
     this.apiKey = options.apiKey || '';
     this.debug = !!options.debug;
-    this.serviceName = options.serviceName;
 
     // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
@@ -215,7 +213,6 @@ export class VantaTrace {
 
       const payload: ErrorPayload = {
         apiKey: this.apiKey,
-        serviceName: this.serviceName,
         timestamp: new Date().toISOString(),
         traceId,
         error: normalized,
@@ -860,4 +857,5 @@ export class VantaTrace {
     this._tryPatchPino();
   }
 }
+export { flushAllQueues } from './transport';
 export default VantaTrace;
