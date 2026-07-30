@@ -72,6 +72,18 @@ export interface GeoLocationInfo {
   city?: string;
 }
 
+export type SpanType = 'http' | 'db' | 'redis' | 'custom';
+
+/** A single timed sub-operation (outbound HTTP call, DB query, Redis command) within a request, used to render a request waterfall. */
+export interface Span {
+  id: string;
+  type: SpanType;
+  name: string;
+  startTime: number;
+  endTime: number;
+  duration: number;
+}
+
 export interface VantaTraceContext {
   userId?: string;
   user?: UserContextInfo;
@@ -93,6 +105,8 @@ export interface VantaTraceContext {
   metadata?: Record<string, any>;
   severity?: 'critical' | 'warning' | 'info';
   breadcrumbs?: Breadcrumb[];
+  /** Timed sub-operations captured during this request (outbound HTTP/DB/Redis calls), used to render a request waterfall. */
+  spans?: Span[];
 }
 
 /** Normalized cause chain entry for errors thrown with { cause: originalError }. */
@@ -137,6 +151,12 @@ export interface ErrorPayload {
     };
     loadavg: number[];
     uptime: number;
+    /** Percentage of wall-clock time the process spent on CPU since the last sample. Can exceed 100 on multi-core work. */
+    cpu?: {
+      percent: number;
+    };
+    /** Mean event loop delay in milliseconds over the last sampling window — a proxy for how busy/blocked the event loop is. */
+    eventLoopLag?: number;
   };
   severity?: 'critical' | 'warning' | 'info';
   breadcrumbs?: Breadcrumb[];
