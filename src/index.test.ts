@@ -98,6 +98,84 @@ test('autoCapture.http5xx: false disables the synthetic capture', () => {
   assert.equal(calls.length, 0);
 });
 
+test('4xx response (not in the default exclude list) emits a synthetic HttpClientError with warning severity', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(400);
+
+  instance.requestHandler()(req, res, () => {
+    // Route validates input and responds 400 without throwing.
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error.name, 'HttpClientError');
+  assert.match(calls[0].error.message, /GET \/api\/v1\/check responded with HTTP 400/);
+  assert.equal(calls[0].context.metadata.captureStrategy, 'http4xx');
+  assert.equal(calls[0].context.metadata.httpStatusCode, 400);
+  assert.equal(calls[0].context.severity, 'warning');
+});
+
+test('401 and 404 are excluded from 4xx capture by default', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+
+  for (const status of [401, 404]) {
+    const { req, res } = fakeReqRes(status);
+    instance.requestHandler()(req, res, () => {});
+    res.emit('finish');
+  }
+
+  assert.equal(calls.length, 0);
+});
+
+test('autoCapture.httpClientErrors: false disables all 4xx synthetic capture', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { httpClientErrors: false } });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(403);
+
+  instance.requestHandler()(req, res, () => {});
+  res.emit('finish');
+
+  assert.equal(calls.length, 0);
+});
+
+test('autoCapture.httpClientErrors.exclude overrides the default [401, 404] exclusion list', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { httpClientErrors: { exclude: [400] } } });
+  const calls = spyOnCapture(instance);
+
+  // 400 is now excluded instead of the default 401/404 — 401 should capture, 400 should not.
+  const excluded = fakeReqRes(400);
+  instance.requestHandler()(excluded.req, excluded.res, () => {});
+  excluded.res.emit('finish');
+
+  const included = fakeReqRes(401);
+  instance.requestHandler()(included.req, included.res, () => {});
+  included.res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].context.metadata.httpStatusCode, 401);
+});
+
+test('a manual captureException during a 4xx request suppresses the synthetic HttpClientError', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(422);
+
+  instance.requestHandler()(req, res, () => {
+    instance.captureException(new Error('validation failed'), { severity: 'warning' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1, 'only the manual capture — no synthetic duplicate');
+  assert.equal(calls[0].error.message, 'validation failed');
+});
+
 test('a manual captureException during the request suppresses the 5xx synthetic', () => {
   _resetForTests();
   const instance = new VantaTrace({ apiKey: '', debug: false });

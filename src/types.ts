@@ -29,6 +29,19 @@ export interface AutoCaptureOptions {
    */
   http5xx?: boolean;
   /**
+   * Capture a synthetic error when a request finishes with a 4xx status code and
+   * no exception was reported — i.e. handled gracefully in application code
+   * (e.g. `res.status(400).json(...)` with no throw), which a plain
+   * try/catch-based error tracker would never see.
+   *
+   * - `true` (default): capture all 4xx except 401 and 404, which are routine
+   *   (token expiry, bot/typo traffic) rather than defects.
+   * - `false`: disabled entirely.
+   * - `{ exclude: number[] }`: capture all 4xx except the given status codes
+   *   (replaces the default `[401, 404]` exclusion list).
+   */
+  httpClientErrors?: boolean | { exclude?: number[] };
+  /**
    * Runtime capture of exceptions handled inside try/catch blocks, powered by the
    * V8 inspector (`Debugger.setPauseOnExceptions('all')`). Captures the real Error
    * object — including engine-generated ReferenceError/TypeError — with its full

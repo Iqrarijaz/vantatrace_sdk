@@ -166,6 +166,7 @@ Options passed to `new VantaTrace({ ... })`:
 | `apiUrl` | `string` | `https://api.vantatrace.com/api/events` | Override the ingestion endpoint (self-hosted/enterprise deployments). |
 | `debug` | `boolean` | `false` | Logs SDK internals to the console — capture attempts, batch sends, retries, disabled-key state. |
 | `autoCapture.http5xx` | `boolean` | `true` | Emit a synthetic error when a request finishes 5xx with no exception reported (see [4a](#automatic-capture-of-trycatch-errors)). |
+| `autoCapture.httpClientErrors` | `boolean \| { exclude?: number[] }` | `true`, excluding `[401, 404]` | Emit a synthetic warning-severity error for eligible 4xx responses with no exception reported (see [4a](#automatic-capture-of-trycatch-errors)). |
 | `autoCapture.caughtExceptions` | `boolean \| CaughtExceptionCaptureOptions` | `false` | Opt-in V8-inspector watcher that recovers the *real* error object from inside `try/catch` blocks (see [4b](#automatic-capture-of-trycatch-errors)). |
 | `autoCapture.caughtExceptions.report` | `'request-failure' \| 'always'` | `'request-failure'` | Whether caught exceptions are only reported when the request ultimately fails, or always. |
 | `autoCapture.caughtExceptions.includeNodeModules` | `boolean` | `false` | Also capture exceptions thrown from inside `node_modules`. |
@@ -323,13 +324,35 @@ no per-catch-block changes required — through two layers:
 ### 4a. Failed-request safety net (enabled by default)
 
 When a request finishes with a **5xx status** and no error was reported for
-it, the SDK emits a synthetic `HttpServerError` event carrying the method,
-route, status code, and full request context
+it, the SDK emits a synthetic `HttpServerError` event (severity `critical`)
+carrying the method, route, status code, and full request context
 (`metadata.captureStrategy: 'http5xx'`). The failure becomes visible on the
 dashboard even though the original error object was swallowed. Disable with:
 
 ```javascript
 new VantaTrace({ apiKey, autoCapture: { http5xx: false } });
+```
+
+**4xx responses are covered too**, at a lower severity. A `res.status(400)`
+or `res.status(422)` sent by application code with no `throw` is exactly the
+kind of "handled gracefully, invisible everywhere else" failure this feature
+exists for — a plain try/catch-based tracker never sees it either. These emit
+a synthetic `HttpClientError` (severity `warning`,
+`metadata.captureStrategy: 'http4xx'`) so you can track validation-error
+rates and anomaly spikes per route without treating every 4xx as a page-worthy
+incident.
+
+`401` and `404` are excluded by default — routine token expiry and
+not-found/bot traffic aren't defects, and including them would drown out the
+signal. Override the exclusion list, or disable 4xx capture entirely:
+
+```javascript
+// Track everything except 404s (e.g. you *do* want to know about 401 spikes,
+// which can indicate an auth outage or a broken OAuth integration):
+new VantaTrace({ apiKey, autoCapture: { httpClientErrors: { exclude: [404] } } });
+
+// Disable 4xx capture entirely (5xx capture is unaffected):
+new VantaTrace({ apiKey, autoCapture: { httpClientErrors: false } });
 ```
 
 Two things make this safety net more useful without any extra config:
