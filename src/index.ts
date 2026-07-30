@@ -1,16 +1,19 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import * as crypto from 'crypto';
-import { VantaTraceOptions, VantaTraceContext, ErrorPayload, Breadcrumb } from './types';
+import { VantaTraceOptions, VantaTraceContext, ErrorPayload, Breadcrumb, Span, SpanType } from './types';
 import { normalizeError } from './normalizer';
 import { getSystemContext, startTelemetrySampling } from './context';
 import { sendPayload } from './transport';
 import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
 import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-exceptions';
+import { tryPatchPg, tryPatchMysql2, tryPatchIoredis } from './instrumentation';
 
 
 /** Cap on caught exceptions buffered per request while waiting for the response outcome. */
 const MAX_BUFFERED_CAUGHT_ERRORS = 20;
+/** Cap on spans (HTTP/DB/Redis sub-calls) recorded per request — oldest is dropped once exceeded. */
+const MAX_SPANS_PER_REQUEST = 100;
 
 export class VantaTrace {
   private apiKey: string;
@@ -93,8 +96,15 @@ export class VantaTrace {
     // Start background system telemetry sampler (runs every 10 seconds, unrefed)
     startTelemetrySampling(10000);
 
-    // Initialize HTTP/HTTPS hooks for breadcrumbs
+    // Initialize HTTP/HTTPS hooks for breadcrumbs + span timing
     this._patchHttp();
+
+    // Best-effort DB/Redis client auto-instrumentation for the span waterfall —
+    // each is a no-op if the corresponding package isn't installed.
+    const startSpanFn: (type: SpanType, name: string) => { end: () => void } = (type, name) => this.startSpan(type, name);
+    tryPatchPg(startSpanFn, this.debug);
+    tryPatchMysql2(startSpanFn, this.debug);
+    tryPatchIoredis(startSpanFn, this.debug);
 
     registerGlobalInstance(this, this.debug);
   }
@@ -387,7 +397,8 @@ export class VantaTrace {
         // `metadata` — auto-captured request data already has its own fields
         // above (body/query/etc.), so it isn't duplicated in here too.
         metadata: {},
-        breadcrumbs: []
+        breadcrumbs: [],
+        spans: []
       };
 
       // Record the outgoing response body when the request ends up failing, so
@@ -664,6 +675,34 @@ export class VantaTrace {
   }
 
   /**
+   * Starts a timed span (an outbound HTTP call, DB query, Redis command, or any
+   * custom sub-operation) scoped to the active request. Call `.end()` when the
+   * operation completes; recorded spans are attached to the next captured
+   * error on this request and rendered as a waterfall on the dashboard.
+   * A no-op outside a request scope (requestHandler() not in the call chain).
+   */
+  public startSpan(type: SpanType, name: string): { end: () => void } {
+    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    const startTime = Date.now();
+    const id = crypto.randomUUID().replace(/-/g, '');
+    let ended = false;
+
+    return {
+      end: () => {
+        if (ended || !store) return;
+        ended = true;
+        try {
+          if (!store.spans) store.spans = [];
+          if (store.spans.length >= MAX_SPANS_PER_REQUEST) store.spans.shift();
+          const endTime = Date.now();
+          const span: Span = { id, type, name, startTime, endTime, duration: endTime - startTime };
+          store.spans.push(span);
+        } catch (_) {}
+      }
+    };
+  }
+
+  /**
    * Safe monkey-patching of outbound HTTP and HTTPS requests to log network breadcrumbs
    */
   private _patchHttp(): void {
@@ -677,9 +716,10 @@ export class VantaTrace {
         const originalRequest = module.request;
 
         module.request = function (options: any, ...args: any[]) {
+          let urlStr = '';
+          let host = '';
+          let isSelf = false;
           try {
-            let urlStr = '';
-            let host = '';
             if (typeof options === 'string') {
               urlStr = options;
               const parsed = new URL(options);
@@ -693,11 +733,9 @@ export class VantaTrace {
 
             // Exclude self-telemetry calls
             const selfUrl = new URL(self.apiUrl);
-            if (host && selfUrl.host && host.toLowerCase() === selfUrl.host.toLowerCase()) {
-              return originalRequest.apply(this, [options, ...args]);
-            }
+            isSelf = !!(host && selfUrl.host && host.toLowerCase() === selfUrl.host.toLowerCase());
 
-            if (urlStr) {
+            if (!isSelf && urlStr) {
               const method = (options && options.method) || 'GET';
               self.addBreadcrumb({
                 category: 'http',
@@ -708,7 +746,22 @@ export class VantaTrace {
               });
             }
           } catch (_) {}
-          return originalRequest.apply(this, [options, ...args]);
+
+          if (isSelf) {
+            return originalRequest.apply(this, [options, ...args]);
+          }
+
+          const method = (options && options.method) || 'GET';
+          const span = urlStr ? self.startSpan('http', `${method} ${host || urlStr}`) : null;
+          const req = originalRequest.apply(this, [options, ...args]);
+
+          if (span && req && typeof req.once === 'function') {
+            req.once('response', () => span.end());
+            req.once('error', () => span.end());
+            req.once('close', () => span.end());
+          }
+
+          return req;
         };
       };
 
@@ -858,4 +911,5 @@ export class VantaTrace {
   }
 }
 export { flushAllQueues } from './transport';
+export * from './types';
 export default VantaTrace;
