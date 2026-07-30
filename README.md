@@ -171,6 +171,7 @@ Options passed to `new VantaTrace({ ... })`:
 | `autoCapture.caughtExceptions.report` | `'request-failure' \| 'always'` | `'request-failure'` | Whether caught exceptions are only reported when the request ultimately fails, or always. |
 | `autoCapture.caughtExceptions.includeNodeModules` | `boolean` | `false` | Also capture exceptions thrown from inside `node_modules`. |
 | `autoCapture.caughtExceptions.maxPerMinute` | `number` | `120` | Ceiling on recorded caught exceptions per minute, to protect throw-heavy hot paths. |
+| `maskingKeys` | `string[]` | `[]` (merged with built-in defaults) | Additional field names (exact match, case-insensitive) to redact from Winston log metadata (see [Masking log metadata](#masking-log-metadata)). |
 
 ---
 
@@ -567,17 +568,50 @@ is installed in your project — no extra transport wiring required:
 
 - **Winston** — VantaTrace registers itself as an additional transport.
   Any log entry that is (or carries) an `Error` — `logger.error(err)`,
-  `logger.error('msg', { err })`, `logger.error('msg', { error: err })` — is
+  `logger.error('msg', { err })`, `logger.error({ event, err })` — is
   captured, with Winston's log level mapped to VantaTrace severity
   (`error` → `critical`, `warn` → `warning`, everything else → `info`).
+  Winston's common single-object calling convention (`logger.error({ event,
+  functionName, err })`, with no explicit `message` key) is handled
+  correctly — Winston nests the whole object under `info.message` in that
+  case, and VantaTrace unwraps it rather than only reading top-level fields.
+  **Only a real `Error` instance is captured this way** — logging a
+  destructured copy (`err: { message: err.message, stack: err.stack }`)
+  is not, since there's no stack/type to recover; log the real object.
+- **Every other Winston log becomes a breadcrumb**, not just errors.
+  `logger.info(...)`/`logger.debug(...)`/`logger.warn(...)` calls you
+  already have throughout your app turn into request-trace context
+  automatically (capped at 50 per request, same as all other breadcrumbs) —
+  no `addBreadcrumb()` calls needed at any of your existing log sites.
 - **Pino** — the same detection runs against Pino's internal `write` call.
   An `Error` passed directly, or under an `err`/`error` key, is captured the
-  same way.
+  same way. (Pino logs do not currently become breadcrumbs — only Winston.)
 
 Both integrations are **fail-silent**: if the package isn't installed,
 detection throws internally and is caught — nothing breaks, and nothing is
 patched. Neither library is a dependency of `@vantatrace/sdk`; install
 whichever one your project already uses and VantaTrace will find it.
+
+### Masking log metadata
+
+Log metadata pulled in from Winston (the object attached to a captured error
+or a log-derived breadcrumb) isn't covered by the backend's generic
+password/token/secret-shaped scrubbing — a field like `ConsumerName` or
+`CNIC` isn't secret-*shaped*, so it passes through untouched unless you tell
+VantaTrace it's sensitive by name:
+
+```javascript
+new VantaTrace({
+  apiKey: 'YOUR_API_KEY',
+  maskingKeys: ['CNIC', 'ConsumerName', 'BankAccountNumber', 'MAName']
+});
+```
+
+Matching is exact (case-insensitive) against the object's own key names, at
+any nesting depth, merged with a small built-in default list (`password`,
+`token`, `secret`, `pin`, `mpin`, `cvv`, `ssn`, and similar). If your project
+already maintains a masking key list for its own log formatter, reuse the
+same list here.
 
 ---
 

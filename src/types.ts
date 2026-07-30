@@ -59,6 +59,15 @@ export interface VantaTraceOptions {
   apiUrl?: string;
   /** Automatic error-capture behaviors that go beyond the Express error middleware. */
   autoCapture?: AutoCaptureOptions;
+  /**
+   * Additional field names (exact match, case-insensitive) to redact from
+   * Winston log metadata before it's attached to a captured error or
+   * breadcrumb — e.g. domain-specific PII your own log formatter already
+   * masks (CNIC, ConsumerName, BankAccountNumber, ...) that wouldn't be
+   * caught by generic password/token/secret-shaped pattern matching.
+   * Merged with a small built-in default list.
+   */
+  maskingKeys?: string[];
 }
 
 export interface Breadcrumb {

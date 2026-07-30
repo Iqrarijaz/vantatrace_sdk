@@ -8,6 +8,7 @@ import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
 import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-exceptions';
 import { tryPatchPg, tryPatchMysql2, tryPatchIoredis } from './instrumentation';
+import { createMasker } from './masking';
 
 
 /** Cap on caught exceptions buffered per request while waiting for the response outcome. */
@@ -25,6 +26,7 @@ export class VantaTrace {
   private http4xxExclude: Set<number>;
   private caughtReportPolicy: 'request-failure' | 'always';
   private stopCaughtWatcher: (() => void) | null = null;
+  private masker: (value: any) => any;
 
   // native AsyncLocalStorage store to capture request context
   private static asyncLocalStorage = new AsyncLocalStorage<VantaTraceContext>();
@@ -61,6 +63,7 @@ export class VantaTrace {
 
     // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
+    this.masker = createMasker(options.maskingKeys || []);
 
     if (!options.apiKey && this.debug) {
       console.warn('[VantaTrace] WARNING: API key is missing. SDK will run in dry-run mode.');
@@ -691,6 +694,20 @@ export class VantaTrace {
         });
       }
     } catch (_) {}
+  }
+
+  /**
+   * Redacts fields matching `maskingKeys` (plus a small built-in default
+   * list) from an arbitrary object — used to sanitize log metadata pulled in
+   * from outside the SDK's own request context (e.g. a Winston log's data)
+   * before it's attached to a captured error or breadcrumb.
+   */
+  public maskData(value: any): any {
+    try {
+      return this.masker(value);
+    } catch (_) {
+      return value;
+    }
   }
 
   /**
