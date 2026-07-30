@@ -1,6 +1,6 @@
 {
   "name": "@vantatrace/sdk",
-  "version": "0.2.0",
+  "version": "0.3.0-next.0",
   "description": "Drop-in observability SDK for Node.js microservices powering error tracking, structured logging, and real-time telemetry pipelines.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
