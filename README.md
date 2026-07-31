@@ -62,6 +62,7 @@ place.
 - 🚦 **Rate limiting with drop visibility** — global and per-fingerprint caps protect against event storms, with a production-visible (not just `debug`) summary of anything actually dropped
 - 🔗 **Distributed tracing (W3C Trace Context)** — extracts and propagates standard `traceparent` headers, so a trace continues correctly across service boundaries instead of restarting at every hop
 - 📘 **Full TypeScript support** — written in TypeScript, ships with `.d.ts` declarations
+- 📦 **Dual CJS/ESM build** — native `require()` and `import` both resolve to a real build for that module system (not one format re-exported through interop shims), so bundlers get clean tree-shaking either way
 
 ---
 

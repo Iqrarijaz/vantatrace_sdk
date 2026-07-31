@@ -23,6 +23,9 @@
  * throw/catch as control flow — which is why this capability is opt-in.
  */
 
+import { fileURLToPath } from 'url';
+import { dynamicRequire } from './nodeRequire';
+
 export interface CaughtExceptionInfo {
   /** V8's prediction of whether the throw will escape every handler on the stack. */
   uncaught: boolean;
@@ -57,7 +60,7 @@ function normalizePath(p: string): string {
   // Script URLs from the inspector come in file:// form; compare as plain paths.
   if (out.startsWith('file://')) {
     try {
-      out = normalizePath(require('url').fileURLToPath(out));
+      out = normalizePath(fileURLToPath(out));
     } catch (_e) {
       out = out.slice('file://'.length);
     }
@@ -80,7 +83,7 @@ export function startCaughtExceptionWatcher(
 ): (() => void) | null {
   let inspector: typeof import('inspector');
   try {
-    inspector = require('inspector');
+    inspector = dynamicRequire('inspector');
   } catch (_e) {
     if (options.debug) {
       console.warn('[VantaTrace] node:inspector is unavailable in this runtime; caught-exception capture disabled.');

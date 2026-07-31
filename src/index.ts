@@ -11,6 +11,7 @@ import { tryPatchPg, tryPatchMysql2, tryPatchIoredis } from './instrumentation';
 import { createMasker } from './masking';
 import { createRateLimiter, RateLimiter } from './rateLimiter';
 import { parseTraceParent, buildTraceParent, generateSpanId } from './tracecontext';
+import { dynamicRequire } from './nodeRequire';
 
 
 /** Cap on caught exceptions buffered per request while waiting for the response outcome. */
@@ -851,8 +852,16 @@ export class VantaTrace {
   private _patchHttp(): void {
     const self = this;
     try {
-      const http = require('http');
-      const https = require('https');
+      // Deliberately dynamicRequire(), not a static `import * as http from
+      // 'http'` — this needs the actual shared module.exports singleton to
+      // monkey-patch (so the patch applies process-wide, to any outbound
+      // call anywhere in the host app, not just calls made through this
+      // reference). A static namespace import goes through TypeScript's/
+      // esbuild's __importStar interop helper, which copies properties onto
+      // a new synthetic object under esModuleInterop — mutating .request on
+      // that copy would silently patch nothing real.
+      const http = dynamicRequire('http');
+      const https = dynamicRequire('https');
 
       const patchRequest = (module: any, isHttps: boolean) => {
         if (!module || !module.request) return;
@@ -934,7 +943,7 @@ export class VantaTrace {
    */
   private _tryPatchWinston(): void {
     try {
-      const winston = require('winston');
+      const winston = dynamicRequire('winston');
       if (winston && winston.add) {
         const transport = createWinstonTransport(this);
         if (transport) {
@@ -954,7 +963,7 @@ export class VantaTrace {
    */
   private _tryPatchPino(): void {
     try {
-      const pino = require('pino');
+      const pino = dynamicRequire('pino');
       if (pino && pino.prototype && pino.prototype.write) {
         const originalWrite = pino.prototype.write;
         const self = this;
