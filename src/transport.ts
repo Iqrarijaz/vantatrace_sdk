@@ -98,6 +98,37 @@ const MAX_PENDING_REQUESTS = 50; // Soft ceiling: start dropping low-severity er
 const ABSOLUTE_MAX_PENDING_REQUESTS = 100; // Hard ceiling: drop all errors to prevent OOM
 
 /**
+ * Transport-level drop counters — every path that silently discards an event
+ * (previously visible only via `debug: true` console lines, i.e. never in
+ * production) increments one of these, so a consuming app can surface "N
+ * events dropped" without needing debug logging enabled.
+ */
+export interface TransportDropStats {
+  backpressureSoft: number;
+  backpressureHard: number;
+  apiKeyDisabled: number;
+  sendFailureExhausted: number;
+}
+
+const transportDrops: TransportDropStats = {
+  backpressureSoft: 0,
+  backpressureHard: 0,
+  apiKeyDisabled: 0,
+  sendFailureExhausted: 0
+};
+
+export function getTransportDropStats(): TransportDropStats {
+  return { ...transportDrops };
+}
+
+export function resetTransportDropStats(): void {
+  transportDrops.backpressureSoft = 0;
+  transportDrops.backpressureHard = 0;
+  transportDrops.apiKeyDisabled = 0;
+  transportDrops.sendFailureExhausted = 0;
+}
+
+/**
  * Queue an error payload and schedule flushing.
  * If the payload is marked critical (e.g. uncaught exceptions), it will flush immediately.
  */
@@ -108,6 +139,7 @@ export function sendPayload(
   debug: boolean = false
 ): void {
   if (isKeyDisabled(apiKey)) {
+    transportDrops.apiKeyDisabled++;
     if (debug) {
       console.log(`[VantaTrace] Event skipped: API Key is temporarily disabled.`);
     }
@@ -116,6 +148,7 @@ export function sendPayload(
 
   // 1. Enforce hard backpressure ceiling
   if (pendingRequestsCount >= ABSOLUTE_MAX_PENDING_REQUESTS) {
+    transportDrops.backpressureHard++;
     if (debug) {
       console.warn(`[VantaTrace] Hard backpressure ceiling reached (${pendingRequestsCount} active batches). Dropping event.`);
     }
@@ -124,6 +157,7 @@ export function sendPayload(
 
   // 2. Enforce soft backpressure ceiling
   if (pendingRequestsCount >= MAX_PENDING_REQUESTS && payload.severity !== 'critical') {
+    transportDrops.backpressureSoft++;
     if (debug) {
       console.warn(`[VantaTrace] Soft backpressure ceiling reached (${pendingRequestsCount} active batches). Dropping non-critical event.`);
     }
@@ -275,6 +309,9 @@ function sendBatch(
           if (retriesRemaining > 0) {
             logDebug(`Retry sending batch, attempts remaining: ${retriesRemaining}`);
             sendBatch(apiUrl, apiKey, batch, debug, retriesRemaining - 1);
+          } else {
+            transportDrops.sendFailureExhausted += batch.length;
+            logDebug(`Retries exhausted — dropping batch of ${batch.length} event(s).`);
           }
         };
 
