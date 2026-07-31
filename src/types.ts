@@ -54,9 +54,9 @@ export interface AutoCaptureOptions {
 }
 
 export interface RateLimitOptions {
-  /** Max captured events per minute, globally, across all fingerprints. `false` disables the global cap. Default: 480 (8/sec). */
+  /** Max captured events per minute, globally, across all fingerprints. `false` disables the global cap. Default: 1000 (~16.7/sec). */
   maxPerMinute?: number | false;
-  /** Max captured events per minute for a single error fingerprint. `false` disables the per-fingerprint cap. Default: 60 (1/sec). */
+  /** Max captured events per minute for a single error fingerprint. `false` disables the per-fingerprint cap. Default: 150 (2.5/sec). */
   maxPerFingerprintPerMinute?: number | false;
   /** Fraction of events (0..1) allowed through after rate-limit checks pass — an additional lever for services with a high sustained baseline of expected failures. Default: 1 (no sampling). */
   sampleRate?: number;

@@ -173,8 +173,8 @@ Options passed to `new VantaTrace({ ... })`:
 | `autoCapture.caughtExceptions.includeNodeModules` | `boolean` | `false` | Also capture exceptions thrown from inside `node_modules`. |
 | `autoCapture.caughtExceptions.maxPerMinute` | `number` | `120` | Ceiling on recorded caught exceptions per minute, to protect throw-heavy hot paths. |
 | `maskingKeys` | `string[]` | `[]` (merged with built-in defaults) | Additional field names (exact match, case-insensitive) to redact from Winston log metadata (see [Masking log metadata](#masking-log-metadata)). |
-| `rateLimit.maxPerMinute` | `number \| false` | `480` | Global cap on captured events per minute, across all fingerprints. `false` disables it. |
-| `rateLimit.maxPerFingerprintPerMinute` | `number \| false` | `60` | Cap on captured events per minute for a single error fingerprint. `false` disables it. |
+| `rateLimit.maxPerMinute` | `number \| false` | `1000` | Global cap on captured events per minute, across all fingerprints. `false` disables it. |
+| `rateLimit.maxPerFingerprintPerMinute` | `number \| false` | `150` | Cap on captured events per minute for a single error fingerprint. `false` disables it. |
 | `rateLimit.sampleRate` | `number` | `1` | Fraction (0..1) of events allowed through after both caps pass. |
 
 ---
@@ -733,8 +733,8 @@ construction), and both are fully visible in production, not just under
 new VantaTrace({
   apiKey: 'YOUR_API_KEY',
   rateLimit: {
-    maxPerMinute: 480,               // global cap across all fingerprints (default)
-    maxPerFingerprintPerMinute: 60,  // one repeating error can't crowd out others (default)
+    maxPerMinute: 1000,               // global cap across all fingerprints (default)
+    maxPerFingerprintPerMinute: 150,  // one repeating error can't crowd out others (default)
     sampleRate: 1                    // 0..1, an additional lever for high-baseline-failure services (default: no sampling)
   }
 });
