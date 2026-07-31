@@ -60,6 +60,7 @@ place.
 - 🌐 **Multi-service support** — a `serviceName` label per instance, built for microservice fleets
 - 🛡️ **Self-defending transport** — backpressure ceilings, retry, gzip, connection pooling, and an automatic kill-switch if your API key is disabled
 - 🚦 **Rate limiting with drop visibility** — global and per-fingerprint caps protect against event storms, with a production-visible (not just `debug`) summary of anything actually dropped
+- 🔗 **Distributed tracing (W3C Trace Context)** — extracts and propagates standard `traceparent` headers, so a trace continues correctly across service boundaries instead of restarting at every hop
 - 📘 **Full TypeScript support** — written in TypeScript, ships with `.d.ts` declarations
 
 ---
@@ -172,6 +173,7 @@ Options passed to `new VantaTrace({ ... })`:
 | `autoCapture.caughtExceptions.report` | `'request-failure' \| 'always'` | `'request-failure'` | Whether caught exceptions are only reported when the request ultimately fails, or always. |
 | `autoCapture.caughtExceptions.includeNodeModules` | `boolean` | `false` | Also capture exceptions thrown from inside `node_modules`. |
 | `autoCapture.caughtExceptions.maxPerMinute` | `number` | `120` | Ceiling on recorded caught exceptions per minute, to protect throw-heavy hot paths. |
+| `autoCapture.caughtExceptions.allowInProduction` | `boolean` | `false` | Required to actually enable the V8 inspector watcher when `NODE_ENV=production` — otherwise it's auto-disabled with a warning, even if `caughtExceptions` was requested. Has no effect outside production. |
 | `maskingKeys` | `string[]` | `[]` (merged with built-in defaults) | Additional field names (exact match, case-insensitive) to redact from Winston log metadata (see [Masking log metadata](#masking-log-metadata)). |
 | `rateLimit.maxPerMinute` | `number \| false` | `1000` | Global cap on captured events per minute, across all fingerprints. `false` disables it. |
 | `rateLimit.maxPerFingerprintPerMinute` | `number \| false` | `150` | Cap on captured events per minute for a single error fingerprint. `false` disables it. |
@@ -422,13 +424,16 @@ and then reaches `errorHandler()` (or a manual `captureException`) is
 reported exactly once.
 
 > [!WARNING]
-> Enabling `autoCapture.caughtExceptions` in production logs a one-time
-> console warning: it's a real operational trade-off, not a free feature.
-> The V8 inspector watcher adds roughly **0.3–0.5ms per thrown exception**
-> while enabled (near-zero when nothing throws) — negligible when exceptions
-> are exceptional, but measurable for code that uses throw/catch as control
-> flow. For zero-runtime-overhead capture, use the
-> [Babel plugin](#zero-code-auto-capture-babel-plugin) instead.
+> When `NODE_ENV=production`, `autoCapture.caughtExceptions` is **auto-disabled**
+> — a real operational trade-off (the V8 inspector watcher adds roughly
+> **0.3–0.5ms per thrown exception** while enabled) isn't something to opt
+> into implicitly. A console warning explains why nothing was started and
+> points at the [Babel plugin](#zero-code-auto-capture-babel-plugin) as the
+> production-safe, zero-runtime-overhead alternative. Set
+> `autoCapture.caughtExceptions.allowInProduction: true` to enable it in
+> production anyway (still logs a warning, since it remains a real trade-off).
+> Outside production, `caughtExceptions: true` works as documented above with
+> no extra flag needed.
 
 Call `vantaTrace.shutdown()` on graceful shutdown to detach the inspector
 session (optional; safe to call multiple times).
@@ -621,11 +626,12 @@ same list here.
 
 ## Trace IDs & Log Correlation
 
-Every error VantaTrace captures carries a `traceId` — a per-request
-identifier generated the first time an error is captured within that
-request's `AsyncLocalStorage` scope, and reused for every subsequent error
-in the same request. This is what lets the dashboard show "these 3 error
-events all came from the same request."
+Every request gets a `traceId` — generated as soon as `requestHandler()`
+runs (not lazily on first error, as in earlier versions), so it's available
+for the whole request lifecycle, not just after something fails. Every
+error captured within that request's `AsyncLocalStorage` scope carries the
+same ID, which is what lets the dashboard show "these 3 error events all
+came from the same request."
 
 You can stamp the same ID onto your own application logs so a VantaTrace
 event and the surrounding log lines can be correlated later:
@@ -640,6 +646,43 @@ logger.info('Processing checkout', {
 
 `getActiveTraceId()` is a static method — call it as `VantaTrace.getActiveTraceId()`,
 not on an instance.
+
+### Distributed tracing across services (W3C Trace Context)
+
+The `traceId` above isn't just an internal label — it's propagated using the
+[W3C Trace Context](https://www.w3.org/TR/trace-context/) standard, so a
+trace continues correctly across a service boundary instead of restarting
+at every hop:
+
+- **Extraction.** If an incoming request carries a valid `traceparent`
+  header (`00-{32-hex trace-id}-{16-hex parent-id}-{2-hex flags}`),
+  `requestHandler()` reuses that trace ID rather than generating a new one,
+  and records the incoming span as `context.parentSpanId`. A malformed or
+  absent header just starts a fresh trace, same as before.
+- **Injection.** Every outbound HTTP/HTTPS call made during that request
+  (via the same monkey-patch that records HTTP breadcrumbs/spans)
+  automatically carries a `traceparent` header built from the active trace
+  ID and this service's own new span ID — so a downstream service (whether
+  it's VantaTrace-instrumented or any other W3C-compliant tracing system)
+  continues the same trace. A `traceparent` header your own code already
+  set on the request is never overwritten.
+- Only the standards-compliant `traceparent` header is honored for
+  continuing a trace — `x-trace-id`/`x-correlation-id`/`x-request-id` stay
+  informational only (`context.correlationId`), since their format isn't
+  guaranteed to be a valid 32-hex trace ID, and feeding an arbitrary value
+  into a spec-compliant header handed to a downstream service would just
+  push a malformed value further down the chain.
+
+`context.spanId` (this service's own span within the trace),
+`context.parentSpanId` (the upstream caller's span, if any), and
+`context.traceparent` (the full header value) are all available on every
+captured error. The parsing/generation utilities are also exported directly
+if you need them outside Express (a message queue consumer, a custom
+protocol):
+
+```javascript
+import { parseTraceParent, buildTraceParent, generateTraceId, generateSpanId } from '@vantatrace/sdk';
+```
 
 ---
 

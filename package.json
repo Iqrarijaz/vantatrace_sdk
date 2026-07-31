@@ -21,7 +21,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/caught-exceptions.test.ts src/index.test.ts src/masking.test.ts src/winston.test.ts src/rateLimiter.test.ts src/instrumentation.test.ts src/transport.test.ts babel-plugin.test.js",
+    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/caught-exceptions.test.ts src/index.test.ts src/masking.test.ts src/winston.test.ts src/rateLimiter.test.ts src/instrumentation.test.ts src/transport.test.ts src/tracecontext.test.ts babel-plugin.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

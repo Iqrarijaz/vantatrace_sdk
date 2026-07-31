@@ -10,6 +10,7 @@ import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-excep
 import { tryPatchPg, tryPatchMysql2, tryPatchIoredis } from './instrumentation';
 import { createMasker } from './masking';
 import { createRateLimiter, RateLimiter } from './rateLimiter';
+import { parseTraceParent, buildTraceParent, generateSpanId } from './tracecontext';
 
 
 /** Cap on caught exceptions buffered per request while waiting for the response outcome. */
@@ -85,21 +86,34 @@ export class VantaTrace {
     this.caughtReportPolicy = caughtConfig.report || 'request-failure';
 
     if (caughtOpts) {
-      if (process.env.NODE_ENV === 'production') {
+      const isProduction = process.env.NODE_ENV === 'production';
+
+      if (isProduction && !caughtConfig.allowInProduction) {
         console.warn(
-          '[VantaTrace] WARNING: Runtime caught-exception capture (V8 inspector watcher) is enabled in production. ' +
-          'This is a high-risk operational choice that can block the event loop and cause latency spikes. ' +
-          'Consider using compile-time AST instrumentation (@vantatrace/babel-plugin) instead.'
+          '[VantaTrace] WARNING: autoCapture.caughtExceptions was requested but is auto-disabled in production ' +
+          '(NODE_ENV=production). The V8 inspector watcher it relies on (Debugger.setPauseOnExceptions(\'all\')) ' +
+          'is a real operational risk — it can block the event loop and cause latency spikes on every thrown ' +
+          'exception, not just this feature\'s own overhead. Use @vantatrace/sdk/babel-plugin instead for ' +
+          'production-safe, compile-time try/catch instrumentation, or set ' +
+          'autoCapture.caughtExceptions.allowInProduction: true to enable it anyway.'
+        );
+      } else {
+        if (isProduction) {
+          console.warn(
+            '[VantaTrace] WARNING: Runtime caught-exception capture (V8 inspector watcher) is enabled in production ' +
+            '(allowInProduction: true). This is a high-risk operational choice that can block the event loop and ' +
+            'cause latency spikes. Consider using compile-time AST instrumentation (@vantatrace/babel-plugin) instead.'
+          );
+        }
+        this.stopCaughtWatcher = startCaughtExceptionWatcher(
+          (error, info) => this._recordCaughtException(error, info),
+          {
+            includeNodeModules: !!caughtConfig.includeNodeModules,
+            maxPerMinute: caughtConfig.maxPerMinute || 120,
+            debug: this.debug
+          }
         );
       }
-      this.stopCaughtWatcher = startCaughtExceptionWatcher(
-        (error, info) => this._recordCaughtException(error, info),
-        {
-          includeNodeModules: !!caughtConfig.includeNodeModules,
-          maxPerMinute: caughtConfig.maxPerMinute || 120,
-          debug: this.debug
-        }
-      );
     }
 
     if (this.debug) {
@@ -458,6 +472,22 @@ export class VantaTrace {
       const correlationId = req.headers?.['x-correlation-id'] || req.headers?.['x-request-id'] || req.headers?.['x-trace-id'];
       const featureFlags = req.featureFlags || req.flags || req.experiments;
 
+      // W3C Trace Context (https://www.w3.org/TR/trace-context/) — only the
+      // standards-compliant `traceparent` header is honored for continuing an
+      // upstream trace (x-trace-id/x-correlation-id above stay informational
+      // only; their format isn't guaranteed to be a valid 32-hex trace-id, and
+      // feeding an arbitrary value into a spec-compliant header we then hand
+      // to a downstream service would just push the malformed value further
+      // down the chain). Trace ID generation is eager here (not lazily on
+      // first captureException call, as before) so it's available for
+      // outbound header injection even on requests that never error.
+      const incomingTraceParentHeader =
+        (typeof req.get === 'function' ? req.get('traceparent') : undefined) || req.headers?.['traceparent'];
+      const parsedTraceParent = parseTraceParent(incomingTraceParentHeader);
+      const traceId = parsedTraceParent ? parsedTraceParent.traceId : this._generateTraceId();
+      const parentSpanId = parsedTraceParent ? parsedTraceParent.parentId : undefined;
+      const spanId = generateSpanId();
+
       const activeContext: any = {
         req,
         userId: userId || undefined,
@@ -475,6 +505,10 @@ export class VantaTrace {
         msisdn,
         appVersion,
         startTime,
+        traceId,
+        spanId,
+        parentSpanId,
+        traceparent: buildTraceParent(traceId, spanId),
         // Reserved for whatever a developer passes to captureException()'s own
         // `metadata` — auto-captured request data already has its own fields
         // above (body/query/etc.), so it isn't duplicated in here too.
@@ -860,9 +894,25 @@ export class VantaTrace {
             return originalRequest.apply(this, [options, ...args]);
           }
 
+          // Propagate the active request's W3C trace context downstream, so a
+          // VantaTrace- (or any W3C-compliant) instrumented service on the
+          // other end continues this trace instead of starting a new one.
+          // Only handled for the object-options calling form — a plain URL
+          // string can't carry headers without restructuring the call
+          // signature, which isn't worth the risk on a widely-used monkey-patch
+          // for a less common calling convention. Never overwrites a
+          // traceparent header the caller already set themselves.
+          let requestOptions = options;
+          try {
+            const activeStore = VantaTrace.asyncLocalStorage.getStore() as any;
+            if (activeStore?.traceparent && options && typeof options === 'object' && !options.headers?.traceparent) {
+              requestOptions = { ...options, headers: { ...options.headers, traceparent: activeStore.traceparent } };
+            }
+          } catch (_) {}
+
           const method = (options && options.method) || 'GET';
           const span = urlStr ? self.startSpan('http', `${method} ${host || urlStr}`) : null;
-          const req = originalRequest.apply(this, [options, ...args]);
+          const req = originalRequest.apply(this, [requestOptions, ...args]);
 
           if (span && req && typeof req.once === 'function') {
             req.once('response', () => span.end());
@@ -1021,4 +1071,5 @@ export class VantaTrace {
 }
 export { flushAllQueues } from './transport';
 export * from './types';
+export { generateTraceId, generateSpanId, parseTraceParent, buildTraceParent, ParsedTraceParent } from './tracecontext';
 export default VantaTrace;
