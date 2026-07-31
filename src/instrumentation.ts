@@ -1,4 +1,5 @@
 import { SpanType } from './types';
+import { dynamicRequire } from './nodeRequire';
 
 export type SpanStarter = (type: SpanType, name: string) => { end: () => void };
 
@@ -88,7 +89,7 @@ export function sanitizeSqlQuery(sql: string): string {
 /** Best-effort auto-instrumentation of `pg` (node-postgres) queries as DB spans. Silently no-ops if `pg` isn't installed. */
 export function tryPatchPg(startSpan: SpanStarter, debug: boolean): void {
   try {
-    const pg = require('pg');
+    const pg = dynamicRequire('pg');
     const nameOf = (args: any[]) => {
       const text = typeof args[0] === 'string' ? args[0] : args[0]?.text;
       return text ? `pg.query: ${truncate(sanitizeSqlQuery(text))}` : 'pg.query';
@@ -104,7 +105,7 @@ export function tryPatchPg(startSpan: SpanStarter, debug: boolean): void {
 /** Best-effort auto-instrumentation of `mysql2` queries as DB spans. Silently no-ops if `mysql2` isn't installed. */
 export function tryPatchMysql2(startSpan: SpanStarter, debug: boolean): void {
   try {
-    const mysql2 = require('mysql2');
+    const mysql2 = dynamicRequire('mysql2');
     const nameOf = (args: any[]) => {
       const text = typeof args[0] === 'string' ? args[0] : args[0]?.sql;
       return text ? `mysql2.query: ${truncate(sanitizeSqlQuery(text))}` : 'mysql2.query';
@@ -126,7 +127,7 @@ export function tryPatchMysql2(startSpan: SpanStarter, debug: boolean): void {
 /** Best-effort auto-instrumentation of `ioredis` commands as Redis spans. Silently no-ops if `ioredis` isn't installed. */
 export function tryPatchIoredis(startSpan: SpanStarter, debug: boolean): void {
   try {
-    const RedisModule = require('ioredis');
+    const RedisModule = dynamicRequire('ioredis');
     const Redis = RedisModule?.default || RedisModule;
     const nameOf = (args: any[]) => {
       const commandName = args[0]?.name;

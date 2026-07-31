@@ -1,10 +1,12 @@
+import { dynamicRequire } from './nodeRequire';
+
 /**
  * Dynamic Winston Transport Builder
  * Safely resolves and extends winston-transport at runtime
  */
 export function createWinstonTransport(sdk: any): any {
   try {
-    const Transport = require('winston-transport');
+    const Transport = dynamicRequire('winston-transport');
 
     class VantaTraceWinstonTransport extends Transport {
       private sdk: any;
