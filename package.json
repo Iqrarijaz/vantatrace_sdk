@@ -20,6 +20,16 @@
       "import": "./dist/runtime.mjs",
       "require": "./dist/runtime.js"
     },
+    "./fastify": {
+      "types": "./dist/fastify.d.ts",
+      "import": "./dist/fastify.mjs",
+      "require": "./dist/fastify.js"
+    },
+    "./nestjs": {
+      "types": "./dist/nestjs.d.ts",
+      "import": "./dist/nestjs.mjs",
+      "require": "./dist/nestjs.js"
+    },
     "./babel-plugin": "./babel-plugin.js"
   },
   "scripts": {
@@ -50,8 +60,11 @@
   },
   "devDependencies": {
     "@babel/core": "^7.29.7",
+    "@nestjs/common": "^11.1.28",
     "@types/node": "^20.11.0",
+    "fastify": "^5.11.0",
     "pino": "^10.3.1",
+    "rxjs": "^7.8.2",
     "tsup": "^8.5.1",
     "tsx": "^4.23.0",
     "typescript": "^5.3.3",

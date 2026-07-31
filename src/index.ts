@@ -372,7 +372,7 @@ export class VantaTrace {
    */
   public requestHandler() {
     return (req: any, res: any, next: any) => {
-      const activeContext: any = buildRequestContext(req, () => this._generateTraceId());
+      const activeContext: any = buildRequestContext(req, () => this._generateTraceId(), (val) => this.maskData(val));
 
       // Record the outgoing response body when the request ends up failing, so
       // a swallowed try/catch (no exception object, no autoCapture.caughtExceptions)

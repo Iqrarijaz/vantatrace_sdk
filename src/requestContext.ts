@@ -1,5 +1,13 @@
 import { parseTraceParent, buildTraceParent, generateSpanId } from './tracecontext';
 
+// Substrings that mark a key (request body/query field, or header name)
+// as sensitive — matched case-insensitively anywhere in the key.
+const SENSITIVE_KEY_SUBSTRINGS = ['password', 'token', 'secret', 'auth', 'pin', 'creditcard', 'cvv', 'cookie', 'api-key'];
+const isSensitiveKey = (key: string): boolean => {
+  const lower = key.toLowerCase();
+  return SENSITIVE_KEY_SUBSTRINGS.some((s) => lower.includes(s));
+};
+
 /**
  * Builds the per-request AsyncLocalStorage context object from an incoming
  * Express request: user identity, MSISDN, sanitized body/query/headers, geo,
@@ -7,7 +15,7 @@ import { parseTraceParent, buildTraceParent, generateSpanId } from './traceconte
  * extraction — no Express response wiring or AsyncLocalStorage.run() here,
  * since those need the SDK instance's own auto-capture finalizer.
  */
-export function buildRequestContext(req: any, generateTraceId: () => string): any {
+export function buildRequestContext(req: any, generateTraceId: () => string, masker: (value: any) => any): any {
   const startTime = Date.now();
 
   // Unified fallback chain regardless of whether req.user is present as
@@ -48,34 +56,8 @@ export function buildRequestContext(req: any, generateTraceId: () => string): an
     return /^\+?\d{7,15}$/.test(cleaned) ? cleaned : undefined;
   })();
 
-  // Substrings that mark a key (request body/query field, or header name)
-  // as sensitive — matched case-insensitively anywhere in the key, so e.g.
-  // 'mpin'/'x-mpin' are covered by 'pin', 'authorization'/
-  // 'proxy-authorization' by 'auth', 'set-cookie' by 'cookie', and
-  // 'x-api-key' by 'api-key'. Shared by body, query, and header
-  // sanitization below so a header carrying the same kind of value (an
-  // MPIN, a token, ...) gets the same treatment as a body/query field.
-  const SENSITIVE_KEY_SUBSTRINGS = ['password', 'token', 'secret', 'auth', 'pin', 'creditcard', 'cvv', 'cookie', 'api-key'];
-  const isSensitiveKey = (key: string): boolean => {
-    const lower = key.toLowerCase();
-    return SENSITIVE_KEY_SUBSTRINGS.some((s) => lower.includes(s));
-  };
-
-  // Redact sensitive-looking keys from a shallow object copy (request body,
-  // query string params — anywhere user-supplied key/value pairs land).
-  const redactSensitiveKeys = (obj: any): any => {
-    if (!obj || typeof obj !== 'object') return obj;
-    const copy = { ...obj };
-    for (const key of Object.keys(copy)) {
-      if (isSensitiveKey(key)) {
-        copy[key] = '[REDACTED]';
-      }
-    }
-    return copy;
-  };
-
-  const sanitizedBody: any = req.body && typeof req.body === 'object' ? redactSensitiveKeys(req.body) : undefined;
-  const sanitizedQuery: any = req.query && typeof req.query === 'object' ? redactSensitiveKeys(req.query) : undefined;
+  const sanitizedBody: any = req.body && typeof req.body === 'object' ? masker(req.body) : undefined;
+  const sanitizedQuery: any = req.query && typeof req.query === 'object' ? masker(req.query) : undefined;
 
   // Extract client IP & Geo headers
   const ip = req.ip || (req.headers && (req.headers['x-forwarded-for'] as string)) || req.socket?.remoteAddress;
