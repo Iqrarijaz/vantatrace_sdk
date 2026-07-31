@@ -236,6 +236,60 @@ export function flushAllQueues(): void {
   }
 }
 
+// A full batch (up to 50 events, each carrying system stats, sanitized
+// request data, up to 50 breadcrumbs, up to 100 spans) can serialize to
+// several hundred KB to ~1MB — a single JSON.stringify() call over that
+// much nested data measurably blocks the event loop (empirically ~4-12ms
+// for 1MB), right when an incident is generating exactly this much volume
+// and every other in-flight request needs the event loop free. Below this
+// threshold the direct single-call path is faster and simpler; there's no
+// point paying chunking overhead for the common small-batch case.
+const SERIALIZE_CHUNK_SIZE = 10;
+
+/**
+ * Serializes a batch to a JSON array string. For batches large enough to
+ * matter, splits the work into chunks and yields to the event loop
+ * (`setImmediate`) between them, trading one long blocking call for many
+ * short ones that interleave with other pending I/O — not offloaded to a
+ * worker thread, since transferring the batch there would itself require a
+ * structured-clone serialization of comparable cost on this same main
+ * thread before handoff, before the worker's own work even begins.
+ */
+export function serializeBatch(batch: ErrorPayload[]): Promise<string> {
+  if (batch.length <= SERIALIZE_CHUNK_SIZE) {
+    try {
+      return Promise.resolve(JSON.stringify(batch));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const parts: string[] = [];
+    let i = 0;
+    // Runs across multiple setImmediate ticks, so a throw here (e.g. a
+    // circular reference in one payload) happens outside any enclosing
+    // try/catch the caller might have — must be handled locally and
+    // surfaced as a rejection, not left to crash the process as an
+    // uncaught exception in a timer callback.
+    const step = () => {
+      try {
+        const chunk = batch.slice(i, i + SERIALIZE_CHUNK_SIZE);
+        parts.push(chunk.map((payload) => JSON.stringify(payload)).join(','));
+        i += SERIALIZE_CHUNK_SIZE;
+        if (i < batch.length) {
+          setImmediate(step);
+        } else {
+          resolve(`[${parts.join(',')}]`);
+        }
+      } catch (err) {
+        reject(err);
+      }
+    };
+    step();
+  });
+}
+
 /**
  * Make the HTTP/HTTPS request using connection pooling to send a batch of events.
  */
@@ -270,11 +324,12 @@ function sendBatch(
 
   // Yield control back to the event loop check phase (non-blocking deferral)
   setImmediate(() => {
-    try {
-      trackRequestStart();
+    trackRequestStart();
 
-      const parsedUrl = new URL(apiUrl);
-      const postData = JSON.stringify(batch);
+    const parsedUrl = new URL(apiUrl);
+
+    serializeBatch(batch).then((postData) => {
+    try {
       const rawBuffer = Buffer.from(postData, 'utf-8');
 
       const executeRequest = (bodyData: Buffer, isCompressed: boolean) => {
@@ -384,5 +439,9 @@ function sendBatch(
       trackRequestEnd();
       logDebug(`Transport batch execution failed: ${err.message}`);
     }
+    }).catch((err: any) => {
+      trackRequestEnd();
+      logDebug(`Batch serialization failed: ${err?.message || err}`);
+    });
   });
 }
