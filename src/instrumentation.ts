@@ -48,13 +48,50 @@ const truncate = (text: any, max = 120): string => {
   return str.length > max ? `${str.slice(0, max)}...` : str;
 };
 
+/**
+ * Strips string/numeric/hex literals and inline comments from a SQL query
+ * before it's used as a span name — a non-parameterized query (or a driver
+ * that logs the fully-interpolated text) embeds real parameter values
+ * directly, which for a fintech-shaped schema means CNICs, phone numbers,
+ * PINs, and account numbers landing verbatim in captured telemetry.
+ *
+ * This is a fast regex-based scrub, not a SQL parser — it's a span label,
+ * not something re-executed, so occasionally over-redacting a harmless
+ * identifier (e.g. a double-quoted Postgres column name) is an acceptable
+ * tradeoff for never under-redacting a real value. Order matters: string
+ * literals are stripped first so comment-marker-shaped substrings *inside*
+ * a string (e.g. `'foo--bar'`) can't be misread as a real comment once the
+ * string content is gone.
+ */
+export function sanitizeSqlQuery(sql: string): string {
+  if (typeof sql !== 'string' || !sql) return sql;
+
+  let result = sql;
+
+  // Single- and double-quoted string literals (handles '' as an escaped quote).
+  result = result.replace(/'(?:[^'\\]|\\.|'')*'/g, '?');
+  result = result.replace(/"(?:[^"\\]|\\.|"")*"/g, '?');
+
+  // Now that string content is gone, remaining comment markers are real.
+  result = result.replace(/\/\*[\s\S]*?\*\//g, ' '); // block comments
+  result = result.replace(/--[^\n]*/g, ' '); // ANSI line comments
+  result = result.replace(/(?:^|\s)#[^\n]*/g, ' '); // MySQL # line comments
+
+  // Hex literals, then standalone numeric literals (word-boundary-bound, so
+  // digits embedded in identifiers like `table_v2` are left untouched).
+  result = result.replace(/\b0x[0-9a-fA-F]+\b/g, '?');
+  result = result.replace(/-?\b\d+(\.\d+)?\b/g, '?');
+
+  return result.replace(/\s+/g, ' ').trim();
+}
+
 /** Best-effort auto-instrumentation of `pg` (node-postgres) queries as DB spans. Silently no-ops if `pg` isn't installed. */
 export function tryPatchPg(startSpan: SpanStarter, debug: boolean): void {
   try {
     const pg = require('pg');
     const nameOf = (args: any[]) => {
       const text = typeof args[0] === 'string' ? args[0] : args[0]?.text;
-      return text ? `pg.query: ${truncate(text)}` : 'pg.query';
+      return text ? `pg.query: ${truncate(sanitizeSqlQuery(text))}` : 'pg.query';
     };
     if (pg?.Client?.prototype) wrapQueryMethod(pg.Client.prototype, 'query', 'db', nameOf, startSpan);
     if (pg?.Pool?.prototype) wrapQueryMethod(pg.Pool.prototype, 'query', 'db', nameOf, startSpan);
@@ -70,7 +107,7 @@ export function tryPatchMysql2(startSpan: SpanStarter, debug: boolean): void {
     const mysql2 = require('mysql2');
     const nameOf = (args: any[]) => {
       const text = typeof args[0] === 'string' ? args[0] : args[0]?.sql;
-      return text ? `mysql2.query: ${truncate(text)}` : 'mysql2.query';
+      return text ? `mysql2.query: ${truncate(sanitizeSqlQuery(text))}` : 'mysql2.query';
     };
     if (mysql2?.Connection?.prototype) {
       wrapQueryMethod(mysql2.Connection.prototype, 'query', 'db', nameOf, startSpan);

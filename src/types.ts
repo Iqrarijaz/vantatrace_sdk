@@ -19,6 +19,16 @@ export interface CaughtExceptionCaptureOptions {
    * app from throw-heavy hot loops). Default: 120.
    */
   maxPerMinute?: number;
+  /**
+   * The V8 inspector watcher this feature relies on
+   * (`Debugger.setPauseOnExceptions('all')`) is a real operational risk in
+   * production — it can block the event loop and cause latency spikes.
+   * When `NODE_ENV === 'production'`, the watcher is auto-disabled (with a
+   * prominent warning pointing to `@vantatrace/sdk/babel-plugin` as the
+   * production-safe alternative) unless this is explicitly set to `true`.
+   * Has no effect outside production. Default: false.
+   */
+  allowInProduction?: boolean;
 }
 
 export interface AutoCaptureOptions {
@@ -148,6 +158,12 @@ export interface VantaTraceContext {
   breadcrumbs?: Breadcrumb[];
   /** Timed sub-operations captured during this request (outbound HTTP/DB/Redis calls), used to render a request waterfall. */
   spans?: Span[];
+  /** This service's own W3C span ID for the current request (16 hex chars). */
+  spanId?: string;
+  /** The parent span ID parsed from an incoming `traceparent` header, if this request continues an upstream trace. */
+  parentSpanId?: string;
+  /** The W3C `traceparent` header value for this request — reuses the incoming trace ID if present, otherwise starts a new trace. Inject this on outbound calls to propagate the trace to a downstream service. */
+  traceparent?: string;
 }
 
 /** Normalized cause chain entry for errors thrown with { cause: originalError }. */

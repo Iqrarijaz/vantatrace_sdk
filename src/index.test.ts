@@ -613,3 +613,180 @@ test('_reportDropsIfAny resets counters after logging, so a quiet interval repor
   (instance as any)._reportDropsIfAny();
   assert.equal(instance.getDropStats().total, 0, 'counters are reset after the periodic report');
 });
+
+test('caughtExceptions is auto-disabled in production without allowInProduction, with a warning', () => {
+  _resetForTests();
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { caughtExceptions: true } });
+    assert.equal((instance as any).stopCaughtWatcher, null, 'the watcher was never started');
+    assert.ok(warnings.some(w => w.includes('auto-disabled in production')), 'warns about the auto-disable');
+    instance.shutdown();
+  } finally {
+    console.warn = originalWarn;
+    process.env.NODE_ENV = originalEnv;
+  }
+});
+
+test('caughtExceptions.allowInProduction: true starts the watcher in production anyway', () => {
+  _resetForTests();
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    const instance = new VantaTrace({
+      apiKey: '',
+      debug: false,
+      autoCapture: { caughtExceptions: { allowInProduction: true } }
+    });
+    assert.notEqual((instance as any).stopCaughtWatcher, null, 'the watcher was started');
+    assert.ok(warnings.some(w => w.includes('allowInProduction: true')), 'still warns that this is a risk, even when explicitly opted in');
+    instance.shutdown();
+  } finally {
+    console.warn = originalWarn;
+    process.env.NODE_ENV = originalEnv;
+  }
+});
+
+test('caughtExceptions starts normally outside production, without needing allowInProduction', () => {
+  _resetForTests();
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'development';
+
+  try {
+    const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { caughtExceptions: true } });
+    assert.notEqual((instance as any).stopCaughtWatcher, null);
+    instance.shutdown();
+  } finally {
+    process.env.NODE_ENV = originalEnv;
+  }
+});
+
+test('requestHandler() generates a fresh W3C-shaped trace/span ID when there is no incoming traceparent', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.match(store.traceId, /^[0-9a-f]{32}$/);
+  assert.match(store.spanId, /^[0-9a-f]{16}$/);
+  assert.equal(store.parentSpanId, undefined);
+  assert.equal(store.traceparent, `00-${store.traceId}-${store.spanId}-01`);
+});
+
+test('requestHandler() continues an upstream trace from a valid incoming traceparent header', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  const upstreamTraceId = '0af7651916cd43dd8448eb211c80319c';
+  const upstreamSpanId = 'b7ad6b7169203331';
+  req.get = (name: string) => (name.toLowerCase() === 'traceparent' ? `00-${upstreamTraceId}-${upstreamSpanId}-01` : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.traceId, upstreamTraceId, 'reuses the upstream trace ID rather than starting a new trace');
+  assert.equal(store.parentSpanId, upstreamSpanId, 'records the upstream span as this request\'s parent');
+  assert.match(store.spanId, /^[0-9a-f]{16}$/);
+  assert.notEqual(store.spanId, upstreamSpanId, 'this service gets its own new span ID, distinct from the parent');
+});
+
+test('requestHandler() ignores a malformed incoming traceparent header and starts a fresh trace', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'traceparent' ? 'garbage-not-a-traceparent' : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.match(store.traceId, /^[0-9a-f]{32}$/);
+  assert.equal(store.parentSpanId, undefined);
+});
+
+test('the trace ID stays stable across multiple captures in the same request (set eagerly, not lazily regenerated)', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+
+  let idBeforeAnyCapture: string | undefined;
+  let idAfterFirstCapture: string | undefined;
+  let idAfterSecondCapture: string | undefined;
+
+  instance.requestHandler()(req, res, () => {
+    idBeforeAnyCapture = VantaTrace.getActiveTraceId();
+    instance.captureException(new Error('first'));
+    idAfterFirstCapture = VantaTrace.getActiveTraceId();
+    instance.captureException(new Error('second'));
+    idAfterSecondCapture = VantaTrace.getActiveTraceId();
+  });
+
+  assert.ok(idBeforeAnyCapture, 'trace ID exists before any error is captured — proves eager assignment in requestHandler()');
+  assert.equal(idAfterFirstCapture, idBeforeAnyCapture);
+  assert.equal(idAfterSecondCapture, idBeforeAnyCapture);
+});
+
+test('outbound HTTP calls propagate the active request\'s traceparent header downstream', async () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const http = require('http');
+
+  const server = http.createServer((req: any, res: any) => {
+    (server as any)._receivedTraceparent = req.headers['traceparent'];
+    res.writeHead(200);
+    res.end('ok');
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+
+  const { req, res } = fakeReqRes(200);
+  let capturedTraceparent: string | undefined;
+
+  await new Promise<void>((resolve) => {
+    instance.requestHandler()(req, res, () => {
+      const store = (VantaTrace as any).asyncLocalStorage.getStore();
+      capturedTraceparent = store.traceparent;
+      const outbound = http.request({ hostname: '127.0.0.1', port, path: '/', method: 'GET' }, () => resolve());
+      outbound.end();
+    });
+  });
+
+  assert.equal((server as any)._receivedTraceparent, capturedTraceparent);
+  server.close();
+});
+
+test('outbound HTTP calls do not overwrite a traceparent header the caller already set explicitly', async () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const http = require('http');
+
+  const server = http.createServer((req: any, res: any) => {
+    (server as any)._receivedTraceparent = req.headers['traceparent'];
+    res.writeHead(200);
+    res.end('ok');
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+
+  const manualTraceparent = '00-11111111111111111111111111111111-2222222222222222-01';
+  const { req, res } = fakeReqRes(200);
+
+  await new Promise<void>((resolve) => {
+    instance.requestHandler()(req, res, () => {
+      const outbound = http.request(
+        { hostname: '127.0.0.1', port, path: '/', method: 'GET', headers: { traceparent: manualTraceparent } },
+        () => resolve()
+      );
+      outbound.end();
+    });
+  });
+
+  assert.equal((server as any)._receivedTraceparent, manualTraceparent);
+  server.close();
+});
