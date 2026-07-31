@@ -53,6 +53,15 @@ export interface AutoCaptureOptions {
   caughtExceptions?: boolean | CaughtExceptionCaptureOptions;
 }
 
+export interface RateLimitOptions {
+  /** Max captured events per minute, globally, across all fingerprints. `false` disables the global cap. Default: 480 (8/sec). */
+  maxPerMinute?: number | false;
+  /** Max captured events per minute for a single error fingerprint. `false` disables the per-fingerprint cap. Default: 60 (1/sec). */
+  maxPerFingerprintPerMinute?: number | false;
+  /** Fraction of events (0..1) allowed through after rate-limit checks pass — an additional lever for services with a high sustained baseline of expected failures. Default: 1 (no sampling). */
+  sampleRate?: number;
+}
+
 export interface VantaTraceOptions {
   apiKey: string;
   debug?: boolean;
@@ -68,6 +77,16 @@ export interface VantaTraceOptions {
    * Merged with a small built-in default list.
    */
   maskingKeys?: string[];
+  /**
+   * Proactive volume control on captured events, checked before the
+   * transport's reactive backpressure ceiling — protects both the host app
+   * and the ingestion pipeline during an event storm (e.g. a downstream
+   * dependency outage causing every request to fail at once), and ensures
+   * one repeating error doesn't crowd out visibility into other failures.
+   * See `getDropStats()` to monitor what this — and transport backpressure —
+   * actually drops.
+   */
+  rateLimit?: RateLimitOptions;
 }
 
 export interface Breadcrumb {

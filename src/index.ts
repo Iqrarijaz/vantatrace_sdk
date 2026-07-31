@@ -3,12 +3,13 @@ import * as crypto from 'crypto';
 import { VantaTraceOptions, VantaTraceContext, ErrorPayload, Breadcrumb, Span, SpanType } from './types';
 import { normalizeError } from './normalizer';
 import { getSystemContext, startTelemetrySampling } from './context';
-import { sendPayload } from './transport';
+import { sendPayload, getTransportDropStats, resetTransportDropStats } from './transport';
 import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
 import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-exceptions';
 import { tryPatchPg, tryPatchMysql2, tryPatchIoredis } from './instrumentation';
 import { createMasker } from './masking';
+import { createRateLimiter, RateLimiter } from './rateLimiter';
 
 
 /** Cap on caught exceptions buffered per request while waiting for the response outcome. */
@@ -27,6 +28,8 @@ export class VantaTrace {
   private caughtReportPolicy: 'request-failure' | 'always';
   private stopCaughtWatcher: (() => void) | null = null;
   private masker: (value: any) => any;
+  private rateLimiter: RateLimiter;
+  private dropReportInterval: NodeJS.Timeout | null = null;
 
   // native AsyncLocalStorage store to capture request context
   private static asyncLocalStorage = new AsyncLocalStorage<VantaTraceContext>();
@@ -64,6 +67,7 @@ export class VantaTrace {
     // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
     this.masker = createMasker(options.maskingKeys || []);
+    this.rateLimiter = createRateLimiter(options.rateLimit || {});
 
     if (!options.apiKey && this.debug) {
       console.warn('[VantaTrace] WARNING: API key is missing. SDK will run in dry-run mode.');
@@ -105,6 +109,14 @@ export class VantaTrace {
     // Start background system telemetry sampler (runs every 10 seconds, unrefed)
     startTelemetrySampling(10000);
 
+    // Periodic drop-visibility report — independent of `debug`, so a
+    // production deployment isn't blind to its own dropped events (rate
+    // limiting, sampling, transport backpressure, exhausted retries). Only
+    // logs when something was actually dropped in the interval; unrefed so
+    // it never keeps the process alive.
+    this.dropReportInterval = setInterval(() => this._reportDropsIfAny(), 60000);
+    this.dropReportInterval.unref?.();
+
     // Initialize HTTP/HTTPS hooks for breadcrumbs + span timing
     this._patchHttp();
 
@@ -126,6 +138,54 @@ export class VantaTrace {
     if (this.stopCaughtWatcher) {
       this.stopCaughtWatcher();
       this.stopCaughtWatcher = null;
+    }
+    if (this.dropReportInterval) {
+      clearInterval(this.dropReportInterval);
+      this.dropReportInterval = null;
+    }
+  }
+
+  /**
+   * Snapshot of events dropped since the last periodic report (rate limiting,
+   * sampling, transport backpressure, exhausted retries, disabled API key).
+   * Poll this yourself for alerting, or rely on the automatic summary logged
+   * every 60 seconds when anything was actually dropped.
+   */
+  public getDropStats() {
+    const rl = this.rateLimiter.getDropStats();
+    const transport = getTransportDropStats();
+    return {
+      rateLimitGlobal: rl.rateLimitGlobal,
+      rateLimitFingerprint: rl.rateLimitFingerprint,
+      sampledOut: rl.sampledOut,
+      backpressureSoft: transport.backpressureSoft,
+      backpressureHard: transport.backpressureHard,
+      apiKeyDisabled: transport.apiKeyDisabled,
+      sendFailureExhausted: transport.sendFailureExhausted,
+      total:
+        rl.rateLimitGlobal + rl.rateLimitFingerprint + rl.sampledOut +
+        transport.backpressureSoft + transport.backpressureHard +
+        transport.apiKeyDisabled + transport.sendFailureExhausted
+    };
+  }
+
+  /** Logs and resets the drop counters — called on the 60s interval; only warns when something was actually dropped. */
+  private _reportDropsIfAny(): void {
+    try {
+      const stats = this.getDropStats();
+      if (stats.total > 0) {
+        console.warn(
+          `[VantaTrace] WARNING: ${stats.total} event(s) dropped in the last ~60s — ` +
+          `rateLimitGlobal=${stats.rateLimitGlobal}, rateLimitFingerprint=${stats.rateLimitFingerprint}, ` +
+          `sampledOut=${stats.sampledOut}, backpressureSoft=${stats.backpressureSoft}, ` +
+          `backpressureHard=${stats.backpressureHard}, apiKeyDisabled=${stats.apiKeyDisabled}, ` +
+          `sendFailureExhausted=${stats.sendFailureExhausted}. Call getDropStats() to monitor this programmatically.`
+        );
+      }
+      this.rateLimiter.resetDropStats();
+      resetTransportDropStats();
+    } catch (_) {
+      // Never let reporting itself crash the sampler
     }
   }
 
@@ -174,6 +234,19 @@ export class VantaTrace {
       this._setCapturing(true);
 
       const normalized = normalizeError(error);
+
+      // Proactive volume control — checked before any of the more expensive
+      // work below (system context sampling, context merging, payload
+      // construction). Applies to every capture path (manual, uncaught,
+      // synthetic 4xx/5xx, caught-exception watcher) since they all funnel
+      // through this method.
+      if (!this.rateLimiter.shouldAllow(normalized.fingerprint)) {
+        if (this.debug) {
+          console.log(`[VantaTrace] Event rate-limited/sampled out: ${normalized.name} - ${normalized.message}`);
+        }
+        return;
+      }
+
       const systemContext = getSystemContext();
 
       // Auto-extract request-level context from AsyncLocalStorage store

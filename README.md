@@ -59,6 +59,7 @@ place.
 - 🧩 **Zero-code instrumentation** — an optional Babel plugin injects capture calls into every `try/catch` at build time, with zero runtime overhead
 - 🌐 **Multi-service support** — a `serviceName` label per instance, built for microservice fleets
 - 🛡️ **Self-defending transport** — backpressure ceilings, retry, gzip, connection pooling, and an automatic kill-switch if your API key is disabled
+- 🚦 **Rate limiting with drop visibility** — global and per-fingerprint caps protect against event storms, with a production-visible (not just `debug`) summary of anything actually dropped
 - 📘 **Full TypeScript support** — written in TypeScript, ships with `.d.ts` declarations
 
 ---
@@ -172,6 +173,9 @@ Options passed to `new VantaTrace({ ... })`:
 | `autoCapture.caughtExceptions.includeNodeModules` | `boolean` | `false` | Also capture exceptions thrown from inside `node_modules`. |
 | `autoCapture.caughtExceptions.maxPerMinute` | `number` | `120` | Ceiling on recorded caught exceptions per minute, to protect throw-heavy hot paths. |
 | `maskingKeys` | `string[]` | `[]` (merged with built-in defaults) | Additional field names (exact match, case-insensitive) to redact from Winston log metadata (see [Masking log metadata](#masking-log-metadata)). |
+| `rateLimit.maxPerMinute` | `number \| false` | `480` | Global cap on captured events per minute, across all fingerprints. `false` disables it. |
+| `rateLimit.maxPerFingerprintPerMinute` | `number \| false` | `60` | Cap on captured events per minute for a single error fingerprint. `false` disables it. |
+| `rateLimit.sampleRate` | `number` | `1` | Fraction (0..1) of events allowed through after both caps pass. |
 
 ---
 
@@ -716,6 +720,58 @@ gracefully under load, rather than add risk to your app:
   your process alive on its own) rather than queried synchronously on every
   captured error.
 
+### Rate limiting, sampling & drop visibility
+
+Two independent volume controls exist so a downstream outage that suddenly
+fails every request doesn't turn into an unbounded event storm — and, unlike
+the transport's reactive backpressure ceiling above, both are checked
+*before* the expensive part of a capture (system context, payload
+construction), and both are fully visible in production, not just under
+`debug: true`:
+
+```javascript
+new VantaTrace({
+  apiKey: 'YOUR_API_KEY',
+  rateLimit: {
+    maxPerMinute: 480,               // global cap across all fingerprints (default)
+    maxPerFingerprintPerMinute: 60,  // one repeating error can't crowd out others (default)
+    sampleRate: 1                    // 0..1, an additional lever for high-baseline-failure services (default: no sampling)
+  }
+});
+```
+
+- **Global cap** protects overall volume regardless of how many distinct
+  errors are firing — the primary defense during an incident.
+- **Per-fingerprint cap** ensures one repeating error doesn't consume the
+  entire global budget, so you still see *other*, different failures
+  happening in the same window.
+- **`sampleRate`** is an additional, optional dial for services with a high
+  sustained baseline of expected failures, applied after both caps.
+- Set any cap to `false` to disable it.
+
+**Drop visibility.** Every path that silently discards an event — rate
+limiting, sampling, transport backpressure, an exhausted retry, a disabled
+API key — increments a counter. A background reporter (independent of
+`debug`) logs a summary via `console.warn` every 60 seconds, but only when
+something was actually dropped:
+
+```
+[VantaTrace] WARNING: 340 event(s) dropped in the last ~60s — rateLimitGlobal=200,
+rateLimitFingerprint=140, sampledOut=0, backpressureSoft=0, backpressureHard=0,
+apiKeyDisabled=0, sendFailureExhausted=0. Call getDropStats() to monitor this programmatically.
+```
+
+Or poll it yourself for alerting:
+
+```javascript
+const stats = vantaTrace.getDropStats();
+// { rateLimitGlobal, rateLimitFingerprint, sampledOut, backpressureSoft,
+//   backpressureHard, apiKeyDisabled, sendFailureExhausted, total }
+if (stats.total > 0) {
+  myMetrics.gauge('vantatrace.dropped_events', stats.total);
+}
+```
+
 ---
 
 ## TypeScript Support
@@ -753,7 +809,10 @@ vantaTrace.captureException(error, {
 | `.expressMiddleware()` | **Deprecated.** Alias for `.errorHandler()`. |
 | `.initGlobalHandlers()` | Wires up `uncaughtException`, `unhandledRejection`, and logger interception. See [Global Process Handlers](#global-process-handlers). |
 | `.addBreadcrumb(breadcrumb)` | Record a manual breadcrumb on the active request. See [Breadcrumbs](#breadcrumbs). |
-| `.shutdown()` | Detaches the V8 inspector watcher (if `autoCapture.caughtExceptions` was enabled). Safe to call multiple times. |
+| `.startSpan(type, name)` | Starts a timed span (`'http' \| 'db' \| 'redis' \| 'custom'`); call the returned `.end()` when the operation completes. |
+| `.getDropStats()` | Snapshot of events dropped since the last periodic report (rate limiting, sampling, backpressure, disabled key, exhausted retries). See [Rate limiting, sampling & drop visibility](#rate-limiting-sampling--drop-visibility). |
+| `.maskData(value)` | Redacts `maskingKeys`-matched fields from an arbitrary object — used internally by the Winston integration, exposed for your own use. |
+| `.shutdown()` | Detaches the V8 inspector watcher (if `autoCapture.caughtExceptions` was enabled) and stops the drop-visibility reporter. Safe to call multiple times. |
 | `VantaTrace.getActiveTraceId()` | **Static.** Returns the active request's trace ID, or `undefined` outside a request. See [Trace IDs](#trace-ids--log-correlation). |
 
 ---
