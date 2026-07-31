@@ -29,6 +29,19 @@ export interface AutoCaptureOptions {
    */
   http5xx?: boolean;
   /**
+   * Capture a synthetic error when a request finishes with a 4xx status code and
+   * no exception was reported — i.e. handled gracefully in application code
+   * (e.g. `res.status(400).json(...)` with no throw), which a plain
+   * try/catch-based error tracker would never see.
+   *
+   * - `true` (default): capture all 4xx except 401 and 404, which are routine
+   *   (token expiry, bot/typo traffic) rather than defects.
+   * - `false`: disabled entirely.
+   * - `{ exclude: number[] }`: capture all 4xx except the given status codes
+   *   (replaces the default `[401, 404]` exclusion list).
+   */
+  httpClientErrors?: boolean | { exclude?: number[] };
+  /**
    * Runtime capture of exceptions handled inside try/catch blocks, powered by the
    * V8 inspector (`Debugger.setPauseOnExceptions('all')`). Captures the real Error
    * object — including engine-generated ReferenceError/TypeError — with its full
@@ -40,12 +53,40 @@ export interface AutoCaptureOptions {
   caughtExceptions?: boolean | CaughtExceptionCaptureOptions;
 }
 
+export interface RateLimitOptions {
+  /** Max captured events per minute, globally, across all fingerprints. `false` disables the global cap. Default: 1000 (~16.7/sec). */
+  maxPerMinute?: number | false;
+  /** Max captured events per minute for a single error fingerprint. `false` disables the per-fingerprint cap. Default: 150 (2.5/sec). */
+  maxPerFingerprintPerMinute?: number | false;
+  /** Fraction of events (0..1) allowed through after rate-limit checks pass — an additional lever for services with a high sustained baseline of expected failures. Default: 1 (no sampling). */
+  sampleRate?: number;
+}
+
 export interface VantaTraceOptions {
   apiKey: string;
   debug?: boolean;
   apiUrl?: string;
   /** Automatic error-capture behaviors that go beyond the Express error middleware. */
   autoCapture?: AutoCaptureOptions;
+  /**
+   * Additional field names (exact match, case-insensitive) to redact from
+   * Winston log metadata before it's attached to a captured error or
+   * breadcrumb — e.g. domain-specific PII your own log formatter already
+   * masks (CNIC, ConsumerName, BankAccountNumber, ...) that wouldn't be
+   * caught by generic password/token/secret-shaped pattern matching.
+   * Merged with a small built-in default list.
+   */
+  maskingKeys?: string[];
+  /**
+   * Proactive volume control on captured events, checked before the
+   * transport's reactive backpressure ceiling — protects both the host app
+   * and the ingestion pipeline during an event storm (e.g. a downstream
+   * dependency outage causing every request to fail at once), and ensures
+   * one repeating error doesn't crowd out visibility into other failures.
+   * See `getDropStats()` to monitor what this — and transport backpressure —
+   * actually drops.
+   */
+  rateLimit?: RateLimitOptions;
 }
 
 export interface Breadcrumb {

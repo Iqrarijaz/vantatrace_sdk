@@ -98,6 +98,84 @@ test('autoCapture.http5xx: false disables the synthetic capture', () => {
   assert.equal(calls.length, 0);
 });
 
+test('4xx response (not in the default exclude list) emits a synthetic HttpClientError with warning severity', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(400);
+
+  instance.requestHandler()(req, res, () => {
+    // Route validates input and responds 400 without throwing.
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error.name, 'HttpClientError');
+  assert.match(calls[0].error.message, /GET \/api\/v1\/check responded with HTTP 400/);
+  assert.equal(calls[0].context.metadata.captureStrategy, 'http4xx');
+  assert.equal(calls[0].context.metadata.httpStatusCode, 400);
+  assert.equal(calls[0].context.severity, 'warning');
+});
+
+test('401 and 404 are excluded from 4xx capture by default', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+
+  for (const status of [401, 404]) {
+    const { req, res } = fakeReqRes(status);
+    instance.requestHandler()(req, res, () => {});
+    res.emit('finish');
+  }
+
+  assert.equal(calls.length, 0);
+});
+
+test('autoCapture.httpClientErrors: false disables all 4xx synthetic capture', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { httpClientErrors: false } });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(403);
+
+  instance.requestHandler()(req, res, () => {});
+  res.emit('finish');
+
+  assert.equal(calls.length, 0);
+});
+
+test('autoCapture.httpClientErrors.exclude overrides the default [401, 404] exclusion list', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { httpClientErrors: { exclude: [400] } } });
+  const calls = spyOnCapture(instance);
+
+  // 400 is now excluded instead of the default 401/404 — 401 should capture, 400 should not.
+  const excluded = fakeReqRes(400);
+  instance.requestHandler()(excluded.req, excluded.res, () => {});
+  excluded.res.emit('finish');
+
+  const included = fakeReqRes(401);
+  instance.requestHandler()(included.req, included.res, () => {});
+  included.res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].context.metadata.httpStatusCode, 401);
+});
+
+test('a manual captureException during a 4xx request suppresses the synthetic HttpClientError', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(422);
+
+  instance.requestHandler()(req, res, () => {
+    instance.captureException(new Error('validation failed'), { severity: 'warning' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1, 'only the manual capture — no synthetic duplicate');
+  assert.equal(calls[0].error.message, 'validation failed');
+});
+
 test('a manual captureException during the request suppresses the 5xx synthetic', () => {
   _resetForTests();
   const instance = new VantaTrace({ apiKey: '', debug: false });
@@ -460,4 +538,78 @@ test('app version falls back to a plain x-app-version header when req.get is una
 
   const store = storeFromRequest(instance, req, res);
   assert.equal(store.appVersion, '3.0.0-beta.2');
+});
+
+test('rate limiting: exceeding maxPerFingerprintPerMinute drops later occurrences of the same error', () => {
+  _resetForTests();
+  const instance = new VantaTrace({
+    apiKey: 'k',
+    debug: false,
+    rateLimit: { maxPerMinute: 1000, maxPerFingerprintPerMinute: 3 }
+  });
+  const calls = spyOnCapture(instance);
+
+  // Same name/message/stack shape each time -> same fingerprint.
+  const makeErr = () => {
+    const e = new Error('downstream timeout');
+    e.stack = 'Error: downstream timeout\n    at handler (/app/routes.js:10:5)';
+    return e;
+  };
+
+  for (let i = 0; i < 5; i++) {
+    instance.captureException(makeErr());
+  }
+
+  assert.equal(calls.length, 5, 'captureException is still invoked each time — rate limiting happens inside it');
+  assert.equal(instance.getDropStats().rateLimitFingerprint, 2, '5 attempts - 3 allowed = 2 dropped');
+});
+
+test('rate limiting: maxPerMinute caps total volume even across different fingerprints', () => {
+  _resetForTests();
+  const instance = new VantaTrace({
+    apiKey: 'k',
+    debug: false,
+    rateLimit: { maxPerMinute: 2, maxPerFingerprintPerMinute: 1000 }
+  });
+
+  for (let i = 0; i < 4; i++) {
+    const e = new Error(`unique failure ${i}`);
+    instance.captureException(e);
+  }
+
+  assert.equal(instance.getDropStats().rateLimitGlobal, 2, '4 distinct-fingerprint attempts - 2 allowed globally = 2 dropped');
+});
+
+test('rate limiting does not apply in dry-run mode (no apiKey)', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, rateLimit: { maxPerMinute: 1 } });
+  for (let i = 0; i < 10; i++) {
+    instance.captureException(new Error(`err ${i}`));
+  }
+  assert.equal(instance.getDropStats().total, 0, 'dry-run returns before the rate limiter is ever consulted');
+});
+
+test('getDropStats() aggregates rate-limit and transport-level drop counters together', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: 'k', debug: false, rateLimit: { maxPerMinute: 1 } });
+  instance.captureException(new Error('a'));
+  instance.captureException(new Error('b'));
+
+  const stats = instance.getDropStats();
+  assert.equal(stats.rateLimitGlobal, 1);
+  assert.equal(stats.total, 1);
+  // Transport-level fields are present (0 in this test — no backpressure/disabled-key scenario triggered).
+  assert.equal(stats.backpressureSoft, 0);
+  assert.equal(stats.backpressureHard, 0);
+});
+
+test('_reportDropsIfAny resets counters after logging, so a quiet interval reports nothing next time', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: 'k', debug: false, rateLimit: { maxPerMinute: 1 } });
+  instance.captureException(new Error('a'));
+  instance.captureException(new Error('b'));
+  assert.equal(instance.getDropStats().total, 1);
+
+  (instance as any)._reportDropsIfAny();
+  assert.equal(instance.getDropStats().total, 0, 'counters are reset after the periodic report');
 });

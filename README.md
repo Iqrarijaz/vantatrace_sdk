@@ -59,6 +59,7 @@ place.
 - 🧩 **Zero-code instrumentation** — an optional Babel plugin injects capture calls into every `try/catch` at build time, with zero runtime overhead
 - 🌐 **Multi-service support** — a `serviceName` label per instance, built for microservice fleets
 - 🛡️ **Self-defending transport** — backpressure ceilings, retry, gzip, connection pooling, and an automatic kill-switch if your API key is disabled
+- 🚦 **Rate limiting with drop visibility** — global and per-fingerprint caps protect against event storms, with a production-visible (not just `debug`) summary of anything actually dropped
 - 📘 **Full TypeScript support** — written in TypeScript, ships with `.d.ts` declarations
 
 ---
@@ -166,10 +167,15 @@ Options passed to `new VantaTrace({ ... })`:
 | `apiUrl` | `string` | `https://api.vantatrace.com/api/events` | Override the ingestion endpoint (self-hosted/enterprise deployments). |
 | `debug` | `boolean` | `false` | Logs SDK internals to the console — capture attempts, batch sends, retries, disabled-key state. |
 | `autoCapture.http5xx` | `boolean` | `true` | Emit a synthetic error when a request finishes 5xx with no exception reported (see [4a](#automatic-capture-of-trycatch-errors)). |
+| `autoCapture.httpClientErrors` | `boolean \| { exclude?: number[] }` | `true`, excluding `[401, 404]` | Emit a synthetic warning-severity error for eligible 4xx responses with no exception reported (see [4a](#automatic-capture-of-trycatch-errors)). |
 | `autoCapture.caughtExceptions` | `boolean \| CaughtExceptionCaptureOptions` | `false` | Opt-in V8-inspector watcher that recovers the *real* error object from inside `try/catch` blocks (see [4b](#automatic-capture-of-trycatch-errors)). |
 | `autoCapture.caughtExceptions.report` | `'request-failure' \| 'always'` | `'request-failure'` | Whether caught exceptions are only reported when the request ultimately fails, or always. |
 | `autoCapture.caughtExceptions.includeNodeModules` | `boolean` | `false` | Also capture exceptions thrown from inside `node_modules`. |
 | `autoCapture.caughtExceptions.maxPerMinute` | `number` | `120` | Ceiling on recorded caught exceptions per minute, to protect throw-heavy hot paths. |
+| `maskingKeys` | `string[]` | `[]` (merged with built-in defaults) | Additional field names (exact match, case-insensitive) to redact from Winston log metadata (see [Masking log metadata](#masking-log-metadata)). |
+| `rateLimit.maxPerMinute` | `number \| false` | `1000` | Global cap on captured events per minute, across all fingerprints. `false` disables it. |
+| `rateLimit.maxPerFingerprintPerMinute` | `number \| false` | `150` | Cap on captured events per minute for a single error fingerprint. `false` disables it. |
+| `rateLimit.sampleRate` | `number` | `1` | Fraction (0..1) of events allowed through after both caps pass. |
 
 ---
 
@@ -323,13 +329,35 @@ no per-catch-block changes required — through two layers:
 ### 4a. Failed-request safety net (enabled by default)
 
 When a request finishes with a **5xx status** and no error was reported for
-it, the SDK emits a synthetic `HttpServerError` event carrying the method,
-route, status code, and full request context
+it, the SDK emits a synthetic `HttpServerError` event (severity `critical`)
+carrying the method, route, status code, and full request context
 (`metadata.captureStrategy: 'http5xx'`). The failure becomes visible on the
 dashboard even though the original error object was swallowed. Disable with:
 
 ```javascript
 new VantaTrace({ apiKey, autoCapture: { http5xx: false } });
+```
+
+**4xx responses are covered too**, at a lower severity. A `res.status(400)`
+or `res.status(422)` sent by application code with no `throw` is exactly the
+kind of "handled gracefully, invisible everywhere else" failure this feature
+exists for — a plain try/catch-based tracker never sees it either. These emit
+a synthetic `HttpClientError` (severity `warning`,
+`metadata.captureStrategy: 'http4xx'`) so you can track validation-error
+rates and anomaly spikes per route without treating every 4xx as a page-worthy
+incident.
+
+`401` and `404` are excluded by default — routine token expiry and
+not-found/bot traffic aren't defects, and including them would drown out the
+signal. Override the exclusion list, or disable 4xx capture entirely:
+
+```javascript
+// Track everything except 404s (e.g. you *do* want to know about 401 spikes,
+// which can indicate an auth outage or a broken OAuth integration):
+new VantaTrace({ apiKey, autoCapture: { httpClientErrors: { exclude: [404] } } });
+
+// Disable 4xx capture entirely (5xx capture is unaffected):
+new VantaTrace({ apiKey, autoCapture: { httpClientErrors: false } });
 ```
 
 Two things make this safety net more useful without any extra config:
@@ -544,17 +572,50 @@ is installed in your project — no extra transport wiring required:
 
 - **Winston** — VantaTrace registers itself as an additional transport.
   Any log entry that is (or carries) an `Error` — `logger.error(err)`,
-  `logger.error('msg', { err })`, `logger.error('msg', { error: err })` — is
+  `logger.error('msg', { err })`, `logger.error({ event, err })` — is
   captured, with Winston's log level mapped to VantaTrace severity
   (`error` → `critical`, `warn` → `warning`, everything else → `info`).
+  Winston's common single-object calling convention (`logger.error({ event,
+  functionName, err })`, with no explicit `message` key) is handled
+  correctly — Winston nests the whole object under `info.message` in that
+  case, and VantaTrace unwraps it rather than only reading top-level fields.
+  **Only a real `Error` instance is captured this way** — logging a
+  destructured copy (`err: { message: err.message, stack: err.stack }`)
+  is not, since there's no stack/type to recover; log the real object.
+- **Every other Winston log becomes a breadcrumb**, not just errors.
+  `logger.info(...)`/`logger.debug(...)`/`logger.warn(...)` calls you
+  already have throughout your app turn into request-trace context
+  automatically (capped at 50 per request, same as all other breadcrumbs) —
+  no `addBreadcrumb()` calls needed at any of your existing log sites.
 - **Pino** — the same detection runs against Pino's internal `write` call.
   An `Error` passed directly, or under an `err`/`error` key, is captured the
-  same way.
+  same way. (Pino logs do not currently become breadcrumbs — only Winston.)
 
 Both integrations are **fail-silent**: if the package isn't installed,
 detection throws internally and is caught — nothing breaks, and nothing is
 patched. Neither library is a dependency of `@vantatrace/sdk`; install
 whichever one your project already uses and VantaTrace will find it.
+
+### Masking log metadata
+
+Log metadata pulled in from Winston (the object attached to a captured error
+or a log-derived breadcrumb) isn't covered by the backend's generic
+password/token/secret-shaped scrubbing — a field like `ConsumerName` or
+`CNIC` isn't secret-*shaped*, so it passes through untouched unless you tell
+VantaTrace it's sensitive by name:
+
+```javascript
+new VantaTrace({
+  apiKey: 'YOUR_API_KEY',
+  maskingKeys: ['CNIC', 'ConsumerName', 'BankAccountNumber', 'MAName']
+});
+```
+
+Matching is exact (case-insensitive) against the object's own key names, at
+any nesting depth, merged with a small built-in default list (`password`,
+`token`, `secret`, `pin`, `mpin`, `cvv`, `ssn`, and similar). If your project
+already maintains a masking key list for its own log formatter, reuse the
+same list here.
 
 ---
 
@@ -659,6 +720,58 @@ gracefully under load, rather than add risk to your app:
   your process alive on its own) rather than queried synchronously on every
   captured error.
 
+### Rate limiting, sampling & drop visibility
+
+Two independent volume controls exist so a downstream outage that suddenly
+fails every request doesn't turn into an unbounded event storm — and, unlike
+the transport's reactive backpressure ceiling above, both are checked
+*before* the expensive part of a capture (system context, payload
+construction), and both are fully visible in production, not just under
+`debug: true`:
+
+```javascript
+new VantaTrace({
+  apiKey: 'YOUR_API_KEY',
+  rateLimit: {
+    maxPerMinute: 1000,               // global cap across all fingerprints (default)
+    maxPerFingerprintPerMinute: 150,  // one repeating error can't crowd out others (default)
+    sampleRate: 1                    // 0..1, an additional lever for high-baseline-failure services (default: no sampling)
+  }
+});
+```
+
+- **Global cap** protects overall volume regardless of how many distinct
+  errors are firing — the primary defense during an incident.
+- **Per-fingerprint cap** ensures one repeating error doesn't consume the
+  entire global budget, so you still see *other*, different failures
+  happening in the same window.
+- **`sampleRate`** is an additional, optional dial for services with a high
+  sustained baseline of expected failures, applied after both caps.
+- Set any cap to `false` to disable it.
+
+**Drop visibility.** Every path that silently discards an event — rate
+limiting, sampling, transport backpressure, an exhausted retry, a disabled
+API key — increments a counter. A background reporter (independent of
+`debug`) logs a summary via `console.warn` every 60 seconds, but only when
+something was actually dropped:
+
+```
+[VantaTrace] WARNING: 340 event(s) dropped in the last ~60s — rateLimitGlobal=200,
+rateLimitFingerprint=140, sampledOut=0, backpressureSoft=0, backpressureHard=0,
+apiKeyDisabled=0, sendFailureExhausted=0. Call getDropStats() to monitor this programmatically.
+```
+
+Or poll it yourself for alerting:
+
+```javascript
+const stats = vantaTrace.getDropStats();
+// { rateLimitGlobal, rateLimitFingerprint, sampledOut, backpressureSoft,
+//   backpressureHard, apiKeyDisabled, sendFailureExhausted, total }
+if (stats.total > 0) {
+  myMetrics.gauge('vantatrace.dropped_events', stats.total);
+}
+```
+
 ---
 
 ## TypeScript Support
@@ -696,7 +809,10 @@ vantaTrace.captureException(error, {
 | `.expressMiddleware()` | **Deprecated.** Alias for `.errorHandler()`. |
 | `.initGlobalHandlers()` | Wires up `uncaughtException`, `unhandledRejection`, and logger interception. See [Global Process Handlers](#global-process-handlers). |
 | `.addBreadcrumb(breadcrumb)` | Record a manual breadcrumb on the active request. See [Breadcrumbs](#breadcrumbs). |
-| `.shutdown()` | Detaches the V8 inspector watcher (if `autoCapture.caughtExceptions` was enabled). Safe to call multiple times. |
+| `.startSpan(type, name)` | Starts a timed span (`'http' \| 'db' \| 'redis' \| 'custom'`); call the returned `.end()` when the operation completes. |
+| `.getDropStats()` | Snapshot of events dropped since the last periodic report (rate limiting, sampling, backpressure, disabled key, exhausted retries). See [Rate limiting, sampling & drop visibility](#rate-limiting-sampling--drop-visibility). |
+| `.maskData(value)` | Redacts `maskingKeys`-matched fields from an arbitrary object — used internally by the Winston integration, exposed for your own use. |
+| `.shutdown()` | Detaches the V8 inspector watcher (if `autoCapture.caughtExceptions` was enabled) and stops the drop-visibility reporter. Safe to call multiple times. |
 | `VantaTrace.getActiveTraceId()` | **Static.** Returns the active request's trace ID, or `undefined` outside a request. See [Trace IDs](#trace-ids--log-correlation). |
 
 ---

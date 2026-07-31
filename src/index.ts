@@ -3,11 +3,13 @@ import * as crypto from 'crypto';
 import { VantaTraceOptions, VantaTraceContext, ErrorPayload, Breadcrumb, Span, SpanType } from './types';
 import { normalizeError } from './normalizer';
 import { getSystemContext, startTelemetrySampling } from './context';
-import { sendPayload } from './transport';
+import { sendPayload, getTransportDropStats, resetTransportDropStats } from './transport';
 import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
 import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-exceptions';
 import { tryPatchPg, tryPatchMysql2, tryPatchIoredis } from './instrumentation';
+import { createMasker } from './masking';
+import { createRateLimiter, RateLimiter } from './rateLimiter';
 
 
 /** Cap on caught exceptions buffered per request while waiting for the response outcome. */
@@ -21,8 +23,13 @@ export class VantaTrace {
   private apiUrl: string;
   // Auto-capture configuration (resolved from options.autoCapture)
   private http5xxEnabled: boolean;
+  private http4xxEnabled: boolean;
+  private http4xxExclude: Set<number>;
   private caughtReportPolicy: 'request-failure' | 'always';
   private stopCaughtWatcher: (() => void) | null = null;
+  private masker: (value: any) => any;
+  private rateLimiter: RateLimiter;
+  private dropReportInterval: NodeJS.Timeout | null = null;
 
   // native AsyncLocalStorage store to capture request context
   private static asyncLocalStorage = new AsyncLocalStorage<VantaTraceContext>();
@@ -59,6 +66,8 @@ export class VantaTrace {
 
     // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
+    this.masker = createMasker(options.maskingKeys || []);
+    this.rateLimiter = createRateLimiter(options.rateLimit || {});
 
     if (!options.apiKey && this.debug) {
       console.warn('[VantaTrace] WARNING: API key is missing. SDK will run in dry-run mode.');
@@ -67,6 +76,10 @@ export class VantaTrace {
     // Resolve auto-capture configuration
     const autoCapture = options.autoCapture || {};
     this.http5xxEnabled = autoCapture.http5xx !== false;
+    const clientErrorOpts = autoCapture.httpClientErrors;
+    this.http4xxEnabled = clientErrorOpts !== false;
+    const clientErrorExclude = typeof clientErrorOpts === 'object' && clientErrorOpts !== null ? clientErrorOpts.exclude : undefined;
+    this.http4xxExclude = new Set(clientErrorExclude || [401, 404]);
     const caughtOpts = autoCapture.caughtExceptions;
     const caughtConfig = typeof caughtOpts === 'object' && caughtOpts !== null ? caughtOpts : {};
     this.caughtReportPolicy = caughtConfig.report || 'request-failure';
@@ -96,6 +109,14 @@ export class VantaTrace {
     // Start background system telemetry sampler (runs every 10 seconds, unrefed)
     startTelemetrySampling(10000);
 
+    // Periodic drop-visibility report — independent of `debug`, so a
+    // production deployment isn't blind to its own dropped events (rate
+    // limiting, sampling, transport backpressure, exhausted retries). Only
+    // logs when something was actually dropped in the interval; unrefed so
+    // it never keeps the process alive.
+    this.dropReportInterval = setInterval(() => this._reportDropsIfAny(), 60000);
+    this.dropReportInterval.unref?.();
+
     // Initialize HTTP/HTTPS hooks for breadcrumbs + span timing
     this._patchHttp();
 
@@ -117,6 +138,54 @@ export class VantaTrace {
     if (this.stopCaughtWatcher) {
       this.stopCaughtWatcher();
       this.stopCaughtWatcher = null;
+    }
+    if (this.dropReportInterval) {
+      clearInterval(this.dropReportInterval);
+      this.dropReportInterval = null;
+    }
+  }
+
+  /**
+   * Snapshot of events dropped since the last periodic report (rate limiting,
+   * sampling, transport backpressure, exhausted retries, disabled API key).
+   * Poll this yourself for alerting, or rely on the automatic summary logged
+   * every 60 seconds when anything was actually dropped.
+   */
+  public getDropStats() {
+    const rl = this.rateLimiter.getDropStats();
+    const transport = getTransportDropStats();
+    return {
+      rateLimitGlobal: rl.rateLimitGlobal,
+      rateLimitFingerprint: rl.rateLimitFingerprint,
+      sampledOut: rl.sampledOut,
+      backpressureSoft: transport.backpressureSoft,
+      backpressureHard: transport.backpressureHard,
+      apiKeyDisabled: transport.apiKeyDisabled,
+      sendFailureExhausted: transport.sendFailureExhausted,
+      total:
+        rl.rateLimitGlobal + rl.rateLimitFingerprint + rl.sampledOut +
+        transport.backpressureSoft + transport.backpressureHard +
+        transport.apiKeyDisabled + transport.sendFailureExhausted
+    };
+  }
+
+  /** Logs and resets the drop counters — called on the 60s interval; only warns when something was actually dropped. */
+  private _reportDropsIfAny(): void {
+    try {
+      const stats = this.getDropStats();
+      if (stats.total > 0) {
+        console.warn(
+          `[VantaTrace] WARNING: ${stats.total} event(s) dropped in the last ~60s — ` +
+          `rateLimitGlobal=${stats.rateLimitGlobal}, rateLimitFingerprint=${stats.rateLimitFingerprint}, ` +
+          `sampledOut=${stats.sampledOut}, backpressureSoft=${stats.backpressureSoft}, ` +
+          `backpressureHard=${stats.backpressureHard}, apiKeyDisabled=${stats.apiKeyDisabled}, ` +
+          `sendFailureExhausted=${stats.sendFailureExhausted}. Call getDropStats() to monitor this programmatically.`
+        );
+      }
+      this.rateLimiter.resetDropStats();
+      resetTransportDropStats();
+    } catch (_) {
+      // Never let reporting itself crash the sampler
     }
   }
 
@@ -165,6 +234,19 @@ export class VantaTrace {
       this._setCapturing(true);
 
       const normalized = normalizeError(error);
+
+      // Proactive volume control — checked before any of the more expensive
+      // work below (system context sampling, context merging, payload
+      // construction). Applies to every capture path (manual, uncaught,
+      // synthetic 4xx/5xx, caught-exception watcher) since they all funnel
+      // through this method.
+      if (!this.rateLimiter.shouldAllow(normalized.fingerprint)) {
+        if (this.debug) {
+          console.log(`[VantaTrace] Event rate-limited/sampled out: ${normalized.name} - ${normalized.message}`);
+        }
+        return;
+      }
+
       const systemContext = getSystemContext();
 
       // Auto-extract request-level context from AsyncLocalStorage store
@@ -478,16 +560,28 @@ export class VantaTrace {
   }
 
   /**
-   * Response finalizer for auto-capture. When a request ends with a 5xx status
-   * and no exception was reported for it, this reports the real caught
-   * exception (when the inspector watcher recorded one) or a synthetic
-   * HttpServerError so the failure is at least visible on the dashboard.
+   * Response finalizer for auto-capture. When a request ends with a failure
+   * status (5xx, or an eligible 4xx) and no exception was reported for it,
+   * this reports the real caught exception (when the inspector watcher
+   * recorded one) or a synthetic HttpServerError/HttpClientError so the
+   * failure is visible on the dashboard even when application code handled
+   * it gracefully (e.g. `res.status(400).json(...)` with no throw).
    */
   private _onRequestFinished(store: any, req: any, res: any): void {
     try {
       const status = res?.statusCode;
-      if (!status || status < 500) return;
+      if (!status || status < 400) return;
       if (store._vantaErrorCaptured) return;
+
+      const isServerError = status >= 500;
+
+      // Excluded 4xx codes (401/404 by default — routine token expiry and
+      // not-found/bot traffic, not defects) are skipped entirely, including
+      // when a real caught exception exists for them: the exclusion means
+      // "don't track this status category", not just "don't synthesize".
+      if (!isServerError && this.http4xxExclude.has(status)) return;
+
+      const severity: 'critical' | 'warning' = isServerError ? 'critical' : 'warning';
 
       // Re-enter the request's async context: 'finish' may be emitted from the
       // socket's context, and captureException reads ALS for enrichment.
@@ -507,7 +601,7 @@ export class VantaTrace {
         // cascade failures. Summarize the rest instead of sending N events.
         const [primary, ...rest] = caughtErrors;
         capture(primary, {
-          severity: 'critical',
+          severity,
           metadata: {
             captureStrategy: 'caughtException',
             handled: true,
@@ -521,7 +615,8 @@ export class VantaTrace {
         return;
       }
 
-      if (!this.http5xxEnabled) return;
+      const categoryEnabled = isServerError ? this.http5xxEnabled : this.http4xxEnabled;
+      if (!categoryEnabled) return;
 
       const method = req?.method || store.method || 'UNKNOWN';
       const route = store.route || req?.originalUrl || req?.url || 'unknown route';
@@ -534,13 +629,13 @@ export class VantaTrace {
         : ' Enable autoCapture.caughtExceptions (or use @vantatrace/sdk/babel-plugin) to capture the real error object automatically.';
       const synthetic = new Error(
         `${method} ${route} responded with HTTP ${status} but no exception was reported ` +
-        `(likely swallowed by a try/catch block).${hint}`
+        `(handled internally — e.g. an explicit res.status(${status}) response, or swallowed by a try/catch).${hint}`
       );
-      synthetic.name = 'HttpServerError';
+      synthetic.name = isServerError ? 'HttpServerError' : 'HttpClientError';
       capture(synthetic, {
-        severity: 'critical',
+        severity,
         metadata: {
-          captureStrategy: 'http5xx',
+          captureStrategy: isServerError ? 'http5xx' : 'http4xx',
           handled: true,
           httpStatusCode: status,
           ...(responseBody !== undefined ? { responseBody } : {})
@@ -672,6 +767,20 @@ export class VantaTrace {
         });
       }
     } catch (_) {}
+  }
+
+  /**
+   * Redacts fields matching `maskingKeys` (plus a small built-in default
+   * list) from an arbitrary object — used to sanitize log metadata pulled in
+   * from outside the SDK's own request context (e.g. a Winston log's data)
+   * before it's attached to a captured error or breadcrumb.
+   */
+  public maskData(value: any): any {
+    try {
+      return this.masker(value);
+    } catch (_) {
+      return value;
+    }
   }
 
   /**
