@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'events';
 import { VantaTrace } from './index';
 import { getGlobalInstance, captureExceptionGlobal, _resetForTests } from './registry';
+import { requestStorage } from './store';
 
 type CapturedCall = { error: any; context: any };
 
@@ -393,7 +394,7 @@ test('sensitive query-string keys are redacted the same way request-body keys ar
 
   let capturedQuery: any;
   instance.requestHandler()(req, res, () => {
-    capturedQuery = (VantaTrace as any).asyncLocalStorage.getStore().query;
+    capturedQuery = requestStorage.getStore().query;
   });
 
   assert.equal(capturedQuery.token, '[REDACTED]');
@@ -408,7 +409,7 @@ test('auto-captured request context no longer duplicates query/body under metada
 
   let store: any;
   instance.requestHandler()(req, res, () => {
-    store = (VantaTrace as any).asyncLocalStorage.getStore();
+    store = requestStorage.getStore();
   });
 
   assert.deepEqual(store.query, { page: '2' });
@@ -422,7 +423,7 @@ test('auto-captured request context no longer duplicates query/body under metada
 function storeFromRequest(instance: VantaTrace, req: any, res: any): any {
   let store: any;
   instance.requestHandler()(req, res, () => {
-    store = (VantaTrace as any).asyncLocalStorage.getStore();
+    store = requestStorage.getStore();
   });
   return store;
 }
@@ -750,7 +751,7 @@ test('outbound HTTP calls propagate the active request\'s traceparent header dow
 
   await new Promise<void>((resolve) => {
     instance.requestHandler()(req, res, () => {
-      const store = (VantaTrace as any).asyncLocalStorage.getStore();
+      const store = requestStorage.getStore();
       capturedTraceparent = store.traceparent;
       const outbound = http.request({ hostname: '127.0.0.1', port, path: '/', method: 'GET' }, () => resolve());
       outbound.end();
