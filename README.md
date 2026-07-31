@@ -702,7 +702,14 @@ gracefully under load, rather than add risk to your app:
 - **Connection reuse.** Keep-alive HTTP/HTTPS agents pool TCP/TLS
   connections, and a 30-second in-memory DNS cache avoids repeated lookups
   — both reduce per-request overhead for high-frequency error reporting.
-- **Retry.** A failed batch send is retried once before being dropped.
+- **Retry with backoff.** A failed batch send is retried up to 3 times, with
+  exponential backoff plus jitter between attempts (`min(cap, base * 2^attempt)`
+  + a proportional random jitter, capped at 5 seconds) — staggers retrying
+  clients apart instead of retrying instantly, which would otherwise pile
+  on an already-struggling ingestion endpoint right when it's recovering
+  from an outage. A request timeout now also triggers a retry (previously
+  only network errors and non-2xx responses did — a timed-out batch was
+  silently dropped with no retry at all).
 - **Backpressure.** A soft ceiling (50 concurrent in-flight batches) drops
   non-critical events; a hard ceiling (100) drops everything, protecting
   your process from unbounded memory growth if the ingestion endpoint is
@@ -719,6 +726,16 @@ gracefully under load, rather than add risk to your app:
   sampled on a background 10-second timer (`.unref()`'d, so it never keeps
   your process alive on its own) rather than queried synchronously on every
   captured error.
+- **SQL query sanitization for DB spans.** Auto-instrumented `pg`/`mysql2`
+  queries have their string, numeric, and hex literals stripped (replaced
+  with `?`) before the query text is used as a span name — a
+  non-parameterized query (or one logged with values already interpolated)
+  otherwise embeds real parameter values directly, which for a typical
+  schema means phone numbers, national ID numbers, PINs, and account
+  numbers landing verbatim in captured telemetry. This is a fast
+  regex-based scrub, not a full SQL parser — it's a span label, not
+  something re-executed, so occasionally over-redacting a harmless
+  identifier is an accepted tradeoff for never under-redacting a real value.
 
 ### Rate limiting, sampling & drop visibility
 

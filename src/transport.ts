@@ -128,6 +128,27 @@ export function resetTransportDropStats(): void {
   transportDrops.sendFailureExhausted = 0;
 }
 
+// Retry policy for a failed batch send.
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 200;
+const MAX_DELAY_MS = 5000;
+
+/**
+ * Exponential backoff with jitter for a given retry attempt (0-indexed) —
+ * a pure function of `attempt`, not stateful "decorrelated jitter" (which
+ * tracks the previous delay across calls): `min(cap, base * 2^attempt)`,
+ * plus an additive random jitter proportional to that term. This is the
+ * simpler "equal/full jitter" family — it still staggers concurrent
+ * retrying clients enough to avoid a synchronized retry stampede against
+ * the ingestion endpoint, without needing delay state threaded through the
+ * recursive retry calls.
+ */
+export function calculateBackoffDelay(attempt: number): number {
+  const exponential = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt)));
+  const jitter = Math.random() * exponential;
+  return Math.min(MAX_DELAY_MS, exponential + jitter);
+}
+
 /**
  * Queue an error payload and schedule flushing.
  * If the payload is marked critical (e.g. uncaught exceptions), it will flush immediately.
@@ -223,7 +244,8 @@ function sendBatch(
   apiKey: string,
   batch: ErrorPayload[],
   debug: boolean = false,
-  retriesRemaining: number = 1
+  retriesRemaining: number = MAX_RETRIES,
+  attempt: number = 0
 ): void {
   const logDebug = (msg: string) => {
     if (debug) {
@@ -305,10 +327,23 @@ function sendBatch(
           });
         });
 
+        // Guards against handleRetry() firing twice for the same request —
+        // req.destroy() on timeout can also emit a subsequent 'error' event
+        // depending on Node version/platform, which would otherwise schedule
+        // a duplicate retry (sending the batch twice) rather than just being
+        // a harmless extra bookkeeping call.
+        let retryHandled = false;
         const handleRetry = () => {
+          if (retryHandled) return;
+          retryHandled = true;
+
           if (retriesRemaining > 0) {
-            logDebug(`Retry sending batch, attempts remaining: ${retriesRemaining}`);
-            sendBatch(apiUrl, apiKey, batch, debug, retriesRemaining - 1);
+            const delay = calculateBackoffDelay(attempt);
+            logDebug(`Retry sending batch in ${Math.round(delay)}ms, attempts remaining: ${retriesRemaining}`);
+            const retryTimer = setTimeout(() => {
+              sendBatch(apiUrl, apiKey, batch, debug, retriesRemaining - 1, attempt + 1);
+            }, delay);
+            retryTimer.unref?.();
           } else {
             transportDrops.sendFailureExhausted += batch.length;
             logDebug(`Retries exhausted — dropping batch of ${batch.length} event(s).`);
@@ -325,6 +360,7 @@ function sendBatch(
           trackRequestEnd();
           logDebug('Batch request timeout reached, aborting request');
           req.destroy();
+          handleRetry();
         });
 
         req.write(bodyData);
