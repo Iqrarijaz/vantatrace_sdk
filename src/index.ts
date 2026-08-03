@@ -36,6 +36,12 @@ export class VantaTrace {
   private masker: (value: any) => any;
   private rateLimiter: RateLimiter;
   private dropReportInterval: NodeJS.Timeout | null = null;
+  // Events silently discarded because no apiKey was configured (dry-run mode).
+  // The single most common "works locally, nothing shows up in production"
+  // cause — a prod deployment's env vars don't wire the key the same way a
+  // local .env does — so it gets the same production-visible treatment as
+  // every other drop reason (see getDropStats/_reportDropsIfAny).
+  private dryRunDropped = 0;
 
   // Memory leak-proof duplicate filter
   private reportedErrors = new WeakSet<any>();
@@ -72,8 +78,18 @@ export class VantaTrace {
     this.masker = createMasker(options.maskingKeys || []);
     this.rateLimiter = createRateLimiter(options.rateLimit || {});
 
-    if (!options.apiKey && this.debug) {
-      console.warn('[VantaTrace] WARNING: API key is missing. SDK will run in dry-run mode.');
+    // Not gated by `debug` — a missing key means every single event is
+    // silently discarded from now on, which is exactly the kind of
+    // production-invisible failure `debug: false` should never hide (same
+    // reasoning as the drop-visibility reporter below).
+    if (!options.apiKey) {
+      console.warn(
+        '[VantaTrace] WARNING: API key is missing — the SDK will run in dry-run mode and ' +
+        'silently discard every event (nothing will reach the dashboard). If this is production, ' +
+        'confirm the apiKey is actually wired into this process\'s environment/config — a value ' +
+        'that works via a local .env file often isn\'t set the same way in a deployed container/PM2/K8s ' +
+        'setup. Set `debug: true` to log each event that would have been sent.'
+      );
     }
 
     // Resolve auto-capture configuration
@@ -178,10 +194,12 @@ export class VantaTrace {
       backpressureHard: transport.backpressureHard,
       apiKeyDisabled: transport.apiKeyDisabled,
       sendFailureExhausted: transport.sendFailureExhausted,
+      apiKeyMissing: this.dryRunDropped,
       total:
         rl.rateLimitGlobal + rl.rateLimitFingerprint + rl.sampledOut +
         transport.backpressureSoft + transport.backpressureHard +
-        transport.apiKeyDisabled + transport.sendFailureExhausted
+        transport.apiKeyDisabled + transport.sendFailureExhausted +
+        this.dryRunDropped
     };
   }
 
@@ -195,11 +213,16 @@ export class VantaTrace {
           `rateLimitGlobal=${stats.rateLimitGlobal}, rateLimitFingerprint=${stats.rateLimitFingerprint}, ` +
           `sampledOut=${stats.sampledOut}, backpressureSoft=${stats.backpressureSoft}, ` +
           `backpressureHard=${stats.backpressureHard}, apiKeyDisabled=${stats.apiKeyDisabled}, ` +
-          `sendFailureExhausted=${stats.sendFailureExhausted}. Call getDropStats() to monitor this programmatically.`
+          `sendFailureExhausted=${stats.sendFailureExhausted}, apiKeyMissing=${stats.apiKeyMissing}. ` +
+          `Call getDropStats() to monitor this programmatically.` +
+          (stats.apiKeyMissing > 0
+            ? ' apiKeyMissing > 0 means the SDK has no apiKey configured and is running in dry-run mode — nothing is reaching the dashboard.'
+            : '')
         );
       }
       this.rateLimiter.resetDropStats();
       resetTransportDropStats();
+      this.dryRunDropped = 0;
     } catch (_) {
       // Never let reporting itself crash the sampler
     }
@@ -235,6 +258,7 @@ export class VantaTrace {
 
     try {
       if (!this.apiKey) {
+        this.dryRunDropped++;
         if (this.debug) {
           console.log('[VantaTrace] Dry-run: captured exception:', error, 'Context:', context);
         }
