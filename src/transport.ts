@@ -120,7 +120,7 @@ function getWorker(): import('worker_threads').Worker | null {
     let workerPath = path.join(__dirname, 'transportWorker.js');
     try {
       worker = new Worker(workerPath);
-      worker.on('message', (msg: any) => {
+      worker!.on('message', (msg: any) => {
         if (msg.type === 'backpressure') {
           pendingRequestsCount = msg.pendingRequestsCount;
         } else if (msg.type === 'keyDisabled') {
@@ -131,7 +131,7 @@ function getWorker(): import('worker_threads').Worker | null {
           console.log(`[VantaTrace Worker] ${msg.message}`);
         }
       });
-      worker.on('error', (err: any) => {
+      worker!.on('error', (err: any) => {
         console.error(`[VantaTrace] Worker thread crashed: ${err.message}`);
         useWorker = false; // Fallback to in-process
         worker = null;
