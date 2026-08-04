@@ -118,6 +118,25 @@ test('4xx response (not in the default exclude list) emits a synthetic HttpClien
   assert.equal(calls[0].context.severity, 'warning');
 });
 
+test('422 (Unprocessable Entity) is captured by default like any other non-excluded 4xx', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(422);
+
+  instance.requestHandler()(req, res, () => {
+    // Validation middleware responds 422 without throwing (e.g. Joi/class-validator failure).
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error.name, 'HttpClientError');
+  assert.match(calls[0].error.message, /GET \/api\/v1\/check responded with HTTP 422/);
+  assert.equal(calls[0].context.metadata.captureStrategy, 'http4xx');
+  assert.equal(calls[0].context.metadata.httpStatusCode, 422);
+  assert.equal(calls[0].context.severity, 'warning');
+});
+
 test('401 and 404 are excluded from 4xx capture by default', () => {
   _resetForTests();
   const instance = new VantaTrace({ apiKey: '', debug: false });
@@ -581,13 +600,70 @@ test('rate limiting: maxPerMinute caps total volume even across different finger
   assert.equal(instance.getDropStats().rateLimitGlobal, 2, '4 distinct-fingerprint attempts - 2 allowed globally = 2 dropped');
 });
 
-test('rate limiting does not apply in dry-run mode (no apiKey)', () => {
+test('rate limiting does not apply in dry-run mode (no apiKey), but dry-run drops are still counted', () => {
   _resetForTests();
   const instance = new VantaTrace({ apiKey: '', debug: false, rateLimit: { maxPerMinute: 1 } });
   for (let i = 0; i < 10; i++) {
     instance.captureException(new Error(`err ${i}`));
   }
-  assert.equal(instance.getDropStats().total, 0, 'dry-run returns before the rate limiter is ever consulted');
+  const stats = instance.getDropStats();
+  assert.equal(stats.rateLimitGlobal, 0, 'dry-run returns before the rate limiter is ever consulted');
+  assert.equal(stats.apiKeyMissing, 10, 'every dry-run capture is counted so a misconfigured prod apiKey is production-visible');
+  assert.equal(stats.total, 10);
+});
+
+test('missing apiKey warns on construction even with debug: false', () => {
+  _resetForTests();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    new VantaTrace({ apiKey: '', debug: false });
+    assert.ok(
+      warnings.some((w) => w.includes('API key is missing')),
+      'a missing apiKey must be visible without needing debug: true — this is a total, silent capture failure'
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('no warning is logged on construction when apiKey is provided', () => {
+  _resetForTests();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    new VantaTrace({ apiKey: 'real-key', debug: false });
+    assert.equal(warnings.length, 0);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('_reportDropsIfAny surfaces apiKeyMissing drops in the periodic warning, independent of debug', () => {
+  _resetForTests();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    const instance = new VantaTrace({ apiKey: '', debug: false });
+    warnings.length = 0; // discard the construction-time "API key is missing" warning
+    instance.captureException(new Error('a'));
+    instance.captureException(new Error('b'));
+
+    (instance as any)._reportDropsIfAny();
+
+    assert.ok(
+      warnings.some((w) => w.includes('apiKeyMissing=2') && w.includes('dry-run mode')),
+      'the 60s drop report calls out apiKeyMissing explicitly so it reads as actionable, not just a number'
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test('getDropStats() aggregates rate-limit and transport-level drop counters together', () => {

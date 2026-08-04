@@ -164,7 +164,7 @@ Options passed to `new VantaTrace({ ... })`:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `apiKey` | `string` | — | **Required.** Your VantaTrace project API key. If omitted, the SDK runs in dry-run mode (logs what it *would* send when `debug: true`, sends nothing). |
+| `apiKey` | `string` | — | **Required.** Your VantaTrace project API key. If omitted, the SDK runs in dry-run mode — every event is silently discarded (a production-visible warning is logged regardless of `debug`; set `debug: true` to also log each event that would have been sent). |
 | `serviceName` | `string` | — | Logical service name attached to every event — how you tell microservices apart on the dashboard. |
 | `apiUrl` | `string` | `https://api.vantatrace.com/api/events` | Override the ingestion endpoint (self-hosted/enterprise deployments). |
 | `debug` | `boolean` | `false` | Logs SDK internals to the console — capture attempts, batch sends, retries, disabled-key state. |
@@ -812,14 +812,15 @@ new VantaTrace({
 
 **Drop visibility.** Every path that silently discards an event — rate
 limiting, sampling, transport backpressure, an exhausted retry, a disabled
-API key — increments a counter. A background reporter (independent of
-`debug`) logs a summary via `console.warn` every 60 seconds, but only when
-something was actually dropped:
+API key, a missing API key (dry-run mode) — increments a counter. A
+background reporter (independent of `debug`) logs a summary via
+`console.warn` every 60 seconds, but only when something was actually
+dropped:
 
 ```
 [VantaTrace] WARNING: 340 event(s) dropped in the last ~60s — rateLimitGlobal=200,
 rateLimitFingerprint=140, sampledOut=0, backpressureSoft=0, backpressureHard=0,
-apiKeyDisabled=0, sendFailureExhausted=0. Call getDropStats() to monitor this programmatically.
+apiKeyDisabled=0, sendFailureExhausted=0, apiKeyMissing=0. Call getDropStats() to monitor this programmatically.
 ```
 
 Or poll it yourself for alerting:
@@ -827,7 +828,7 @@ Or poll it yourself for alerting:
 ```javascript
 const stats = vantaTrace.getDropStats();
 // { rateLimitGlobal, rateLimitFingerprint, sampledOut, backpressureSoft,
-//   backpressureHard, apiKeyDisabled, sendFailureExhausted, total }
+//   backpressureHard, apiKeyDisabled, sendFailureExhausted, apiKeyMissing, total }
 if (stats.total > 0) {
   myMetrics.gauge('vantatrace.dropped_events', stats.total);
 }
@@ -900,8 +901,15 @@ service its own project API key (or the same key with a different
 ## Troubleshooting
 
 **No events showing up on the dashboard?**
-- Confirm `apiKey` is set and correct — with no key, the SDK silently runs
-  in dry-run mode (set `debug: true` to see what it would have sent).
+- Confirm `apiKey` is set and correct — with no key, the SDK runs in
+  dry-run mode and discards every event. This logs a
+  `[VantaTrace] WARNING: API key is missing` line on startup (and an
+  `apiKeyMissing` count in the periodic drop report) regardless of `debug`,
+  specifically because this is the single most common "works locally, nothing
+  shows up in production" cause: an `apiKey` wired via a local `.env` file
+  often isn't wired the same way into a deployed container/PM2/K8s process's
+  environment. Set `debug: true` to also log each event that would have been
+  sent.
 - Check for a "API key is temporarily disabled" debug log — see the
   kill-switch note in [Performance, Reliability & Internals](#performance-reliability--internals).
 - If you're relying on `autoCapture.http5xx`/`caughtExceptions` for errors
