@@ -9,7 +9,17 @@ const external = ['pg', 'mysql2', 'ioredis', 'winston', 'winston-transport', 'pi
 
 const entry = {
   index: 'src/index.ts',
-  runtime: 'src/runtime.ts'
+  runtime: 'src/runtime.ts',
+  fastify: 'src/fastify.ts',
+  nestjs: 'src/nestjs.ts',
+  // Loaded at runtime via `new Worker(path.join(__dirname, 'transportWorker.js'))`
+  // (see src/transport.ts) rather than a static import, so tsup has no way to
+  // discover it needs bundling unless it's listed here explicitly. Without
+  // this, dist/transportWorker.js simply doesn't exist in the published
+  // package and every Worker spawn fails with MODULE_NOT_FOUND — silently
+  // falls back to in-process sending (see transport.ts's catch block), but
+  // logs a scary "Worker thread crashed" line on every single process start.
+  transportWorker: 'src/transportWorker.ts'
 };
 
 // Two separate build passes, not one with format: ['cjs', 'esm'] — the
