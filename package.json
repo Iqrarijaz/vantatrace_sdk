@@ -1,8 +1,9 @@
 {
   "name": "@vantatrace/sdk",
-  "version": "0.1.8",
+  "version": "0.5.1",
   "description": "Drop-in observability SDK for Node.js microservices powering error tracking, structured logging, and real-time telemetry pipelines.",
   "main": "dist/index.js",
+  "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
   "files": [
     "dist",
@@ -11,17 +12,29 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
     },
     "./runtime": {
       "types": "./dist/runtime.d.ts",
-      "default": "./dist/runtime.js"
+      "import": "./dist/runtime.mjs",
+      "require": "./dist/runtime.js"
+    },
+    "./fastify": {
+      "types": "./dist/fastify.d.ts",
+      "import": "./dist/fastify.mjs",
+      "require": "./dist/fastify.js"
+    },
+    "./nestjs": {
+      "types": "./dist/nestjs.d.ts",
+      "import": "./dist/nestjs.mjs",
+      "require": "./dist/nestjs.js"
     },
     "./babel-plugin": "./babel-plugin.js"
   },
   "scripts": {
-    "build": "tsc",
-    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/index.test.ts src/scrub.test.ts src/scrub-integration.test.ts babel-plugin.test.js",
+    "build": "tsc --noEmit && tsup && node scripts/verify-dual-build.mjs",
+    "test": "tsx --test src/registry.test.ts src/runtime.test.ts src/caught-exceptions.test.ts src/index.test.ts src/masking.test.ts src/winston.test.ts src/rateLimiter.test.ts src/instrumentation.test.ts src/transport.test.ts src/tracecontext.test.ts src/consoleInstrumentation.test.ts src/httpInstrumentation.test.ts src/pino.test.ts src/autoCaptureFinisher.test.ts src/requestContext.test.ts babel-plugin.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -47,9 +60,16 @@
   },
   "devDependencies": {
     "@babel/core": "^7.29.7",
+    "@nestjs/common": "^11.1.28",
     "@types/node": "^20.11.0",
+    "fastify": "^5.11.0",
+    "pino": "^10.3.1",
+    "rxjs": "^7.8.2",
+    "tsup": "^8.5.1",
     "tsx": "^4.23.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "winston": "^3.19.0",
+    "winston-transport": "^4.9.0"
   },
   "dependencies": {
     "@babel/helper-module-imports": "^7.29.7"
