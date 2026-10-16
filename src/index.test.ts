@@ -1,7 +1,36 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'events';
 import { VantaTrace } from './index';
 import { getGlobalInstance, captureExceptionGlobal, _resetForTests } from './registry';
+import { requestStorage } from './store';
+
+type CapturedCall = { error: any; context: any };
+
+/** Replace captureException with a spy that still marks the request store (like the real one). */
+function spyOnCapture(instance: VantaTrace): CapturedCall[] {
+  const calls: CapturedCall[] = [];
+  const original = instance.captureException.bind(instance);
+  instance.captureException = (error: any, context?: any) => {
+    calls.push({ error, context });
+    return original(error, context);
+  };
+  return calls;
+}
+
+function fakeReqRes(statusCode: number, opts: { query?: any } = {}) {
+  const req: any = { method: 'GET', url: '/api/v1/check', path: '/api/v1/check', headers: {}, query: opts.query || {} };
+  const res: any = new EventEmitter();
+  res.statusCode = statusCode;
+  return { req, res };
+}
+
+/** Adds Express-style res.json/res.send so requestHandler()'s response-body capture has something to patch. */
+function withJsonSend(res: any) {
+  res.json = (body: any) => { res._sentBody = body; return res; };
+  res.send = (body: any) => { res._sentBody = body; return res; };
+  return res;
+}
 
 test('constructing VantaTrace registers it as the global singleton', () => {
   _resetForTests();
@@ -24,4 +53,817 @@ test('captureExceptionGlobal reaches captureException on the constructed instanc
   captureExceptionGlobal(err);
 
   assert.equal(seenError, err);
+});
+
+test('5xx response with no reported error emits a synthetic HttpServerError', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+
+  const handler = instance.requestHandler();
+  handler(req, res, () => {
+    // Route swallows an error silently and responds 500 — nothing captured here.
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error.name, 'HttpServerError');
+  assert.match(calls[0].error.message, /GET \/api\/v1\/check responded with HTTP 500/);
+  assert.equal(calls[0].context.metadata.captureStrategy, 'http5xx');
+  assert.equal(calls[0].context.metadata.httpStatusCode, 500);
+  assert.equal(calls[0].context.severity, 'critical');
+});
+
+test('successful (non-5xx) responses emit nothing', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(404);
+
+  instance.requestHandler()(req, res, () => {});
+  res.emit('finish');
+
+  assert.equal(calls.length, 0);
+});
+
+test('autoCapture.http5xx: false disables the synthetic capture', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { http5xx: false } });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+
+  instance.requestHandler()(req, res, () => {});
+  res.emit('finish');
+
+  assert.equal(calls.length, 0);
+});
+
+test('4xx response (not in the default exclude list) emits a synthetic HttpClientError with warning severity', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(400);
+
+  instance.requestHandler()(req, res, () => {
+    // Route validates input and responds 400 without throwing.
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error.name, 'HttpClientError');
+  assert.match(calls[0].error.message, /GET \/api\/v1\/check responded with HTTP 400/);
+  assert.equal(calls[0].context.metadata.captureStrategy, 'http4xx');
+  assert.equal(calls[0].context.metadata.httpStatusCode, 400);
+  assert.equal(calls[0].context.severity, 'warning');
+});
+
+test('422 (Unprocessable Entity) is captured by default like any other non-excluded 4xx', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(422);
+
+  instance.requestHandler()(req, res, () => {
+    // Validation middleware responds 422 without throwing (e.g. Joi/class-validator failure).
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error.name, 'HttpClientError');
+  assert.match(calls[0].error.message, /GET \/api\/v1\/check responded with HTTP 422/);
+  assert.equal(calls[0].context.metadata.captureStrategy, 'http4xx');
+  assert.equal(calls[0].context.metadata.httpStatusCode, 422);
+  assert.equal(calls[0].context.severity, 'warning');
+});
+
+test('401 and 404 are excluded from 4xx capture by default', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+
+  for (const status of [401, 404]) {
+    const { req, res } = fakeReqRes(status);
+    instance.requestHandler()(req, res, () => {});
+    res.emit('finish');
+  }
+
+  assert.equal(calls.length, 0);
+});
+
+test('autoCapture.httpClientErrors: false disables all 4xx synthetic capture', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { httpClientErrors: false } });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(403);
+
+  instance.requestHandler()(req, res, () => {});
+  res.emit('finish');
+
+  assert.equal(calls.length, 0);
+});
+
+test('autoCapture.httpClientErrors.exclude overrides the default [401, 404] exclusion list', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { httpClientErrors: { exclude: [400] } } });
+  const calls = spyOnCapture(instance);
+
+  // 400 is now excluded instead of the default 401/404 — 401 should capture, 400 should not.
+  const excluded = fakeReqRes(400);
+  instance.requestHandler()(excluded.req, excluded.res, () => {});
+  excluded.res.emit('finish');
+
+  const included = fakeReqRes(401);
+  instance.requestHandler()(included.req, included.res, () => {});
+  included.res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].context.metadata.httpStatusCode, 401);
+});
+
+test('a manual captureException during a 4xx request suppresses the synthetic HttpClientError', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(422);
+
+  instance.requestHandler()(req, res, () => {
+    instance.captureException(new Error('validation failed'), { severity: 'warning' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1, 'only the manual capture — no synthetic duplicate');
+  assert.equal(calls[0].error.message, 'validation failed');
+});
+
+test('a manual captureException during the request suppresses the 5xx synthetic', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+
+  instance.requestHandler()(req, res, () => {
+    // Developer already reported the error inside the catch block.
+    instance.captureException(new Error('order processing failed'), { severity: 'warning' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1, 'only the manual capture — no synthetic duplicate');
+  assert.equal(calls[0].error.message, 'order processing failed');
+});
+
+test('buffered caught exceptions are reported as the root cause of a 5xx response', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+
+  const rootCause = new ReferenceError('a is not defined');
+  const cascade = new Error('fallback also failed');
+
+  instance.requestHandler()(req, res, () => {
+    // Simulate what the inspector watcher records at each throw site.
+    (instance as any)._recordCaughtException(rootCause, { uncaught: false, frameUrl: '/app/routes.js' });
+    (instance as any)._recordCaughtException(cascade, { uncaught: false, frameUrl: '/app/routes.js' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error, rootCause, 'first caught exception wins (root cause)');
+  assert.equal(calls[0].context.metadata.captureStrategy, 'caughtException');
+  assert.equal(calls[0].context.metadata.httpStatusCode, 500);
+  assert.deepEqual(calls[0].context.metadata.additionalCaughtErrors, ['Error: fallback also failed']);
+});
+
+test('buffered caught exceptions are NOT reported when the request succeeds', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(200);
+
+  instance.requestHandler()(req, res, () => {
+    (instance as any)._recordCaughtException(new Error('recovered gracefully'), { uncaught: false, frameUrl: '/app/routes.js' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 0, 'the code recovered — nothing to report');
+});
+
+test("report: 'always' policy captures caught exceptions immediately as warnings", () => {
+  _resetForTests();
+  const instance = new VantaTrace({
+    apiKey: '',
+    debug: false,
+    autoCapture: { caughtExceptions: { report: 'always' } }
+  });
+  instance.shutdown(); // stop the real watcher; drive _recordCaughtException directly
+  const calls = spyOnCapture(instance);
+
+  const err = new Error('caught but interesting');
+  (instance as any)._recordCaughtException(err, { uncaught: false, frameUrl: '/app/worker.js' });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].error, err);
+  assert.equal(calls[0].context.severity, 'warning');
+  assert.equal(calls[0].context.metadata.captureStrategy, 'caughtException');
+  assert.equal(calls[0].context.metadata.throwSite, '/app/worker.js');
+});
+
+test('exceptions predicted uncaught are skipped by the recorder (handled by global handlers)', () => {
+  _resetForTests();
+  const instance = new VantaTrace({
+    apiKey: '',
+    debug: false,
+    autoCapture: { caughtExceptions: { report: 'always' } }
+  });
+  instance.shutdown();
+  const calls = spyOnCapture(instance);
+
+  (instance as any)._recordCaughtException(new Error('will crash anyway'), { uncaught: true, frameUrl: '/app/x.js' });
+
+  assert.equal(calls.length, 0);
+});
+
+test('end-to-end: inspector watcher + Express-style flow captures a swallowed ReferenceError on a 500', () => {
+  _resetForTests();
+  const instance = new VantaTrace({
+    apiKey: '',
+    debug: false,
+    autoCapture: { caughtExceptions: true }
+  });
+  // The watcher's default selfDir filter covers the SDK sources — which is also
+  // where this test file lives. Rebuild it with an inert selfDir for the test.
+  instance.shutdown();
+  const { startCaughtExceptionWatcher } = require('./caught-exceptions');
+  const stopWatcher = startCaughtExceptionWatcher(
+    (error: any, info: any) => (instance as any)._recordCaughtException(error, info),
+    { includeNodeModules: false, maxPerMinute: 1000, debug: false, selfDir: '/vantatrace-nonexistent' }
+  );
+  assert.ok(stopWatcher);
+
+  try {
+    const calls = spyOnCapture(instance);
+    const { req, res } = fakeReqRes(500);
+
+    instance.requestHandler()(req, res, () => {
+      try {
+        // @ts-expect-error intentional undefined reference — the user's exact scenario
+        a;
+      } catch (error) {
+        res.statusCode = 500; // res.status(500).json(...) equivalent
+      }
+    });
+    res.emit('finish');
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].error.name, 'ReferenceError');
+    assert.match(calls[0].error.message, /a is not defined/);
+    assert.equal(calls[0].context.metadata.captureStrategy, 'caughtException');
+    assert.equal(calls[0].context.metadata.httpStatusCode, 500);
+  } finally {
+    stopWatcher!();
+  }
+});
+
+test('the synthetic HttpServerError includes the response body actually sent to the client', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+  withJsonSend(res);
+
+  instance.requestHandler()(req, res, () => {
+    res.json({ error: 'Order failed' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].context.metadata.responseBody, { error: 'Order failed' });
+});
+
+test('a buffered caught exception also carries the response body sent to the client', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+  withJsonSend(res);
+
+  instance.requestHandler()(req, res, () => {
+    (instance as any)._recordCaughtException(new ReferenceError('a is not defined'), { uncaught: false, frameUrl: '/app/routes.js' });
+    res.json({ error: 'Order failed' });
+  });
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].context.metadata.captureStrategy, 'caughtException');
+  assert.deepEqual(calls[0].context.metadata.responseBody, { error: 'Order failed' });
+});
+
+test('response body capture is a no-op when res has no json/send (never throws)', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500); // no res.json/res.send — matches the pre-existing tests' fake res
+
+  instance.requestHandler()(req, res, () => {});
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].context.metadata.responseBody, undefined);
+});
+
+test('the synthetic HttpServerError message nudges toward autoCapture.caughtExceptions when it is not enabled', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false }); // caughtExceptions not enabled
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+
+  instance.requestHandler()(req, res, () => {});
+  res.emit('finish');
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].error.message, /autoCapture\.caughtExceptions/);
+});
+
+test('the synthetic HttpServerError message omits the hint when the watcher is already enabled', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { caughtExceptions: true } });
+  const calls = spyOnCapture(instance);
+  const { req, res } = fakeReqRes(500);
+
+  try {
+    instance.requestHandler()(req, res, () => {});
+    res.emit('finish');
+
+    assert.equal(calls.length, 1);
+    assert.doesNotMatch(calls[0].error.message, /autoCapture\.caughtExceptions/);
+  } finally {
+    instance.shutdown();
+  }
+});
+
+// These two tests inspect the AsyncLocalStorage store requestHandler() builds
+// directly (rather than what's passed to captureException, which is only the
+// explicit second argument a caller provides — auto-extracted request fields
+// like query/body/metadata live on the store itself and get merged in later).
+test('sensitive query-string keys are redacted the same way request-body keys are', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200, { query: { token: 'abc123', page: '2' } });
+
+  let capturedQuery: any;
+  instance.requestHandler()(req, res, () => {
+    capturedQuery = requestStorage.getStore().query;
+  });
+
+  assert.equal(capturedQuery.token, '[REDACTED]');
+  assert.equal(capturedQuery.page, '2');
+});
+
+test('auto-captured request context no longer duplicates query/body under metadata (they live at context.query/context.body)', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200, { query: { page: '2' } });
+  req.body = { name: 'ok' };
+
+  let store: any;
+  instance.requestHandler()(req, res, () => {
+    store = requestStorage.getStore();
+  });
+
+  assert.deepEqual(store.query, { page: '2' });
+  assert.deepEqual(store.body, { name: 'ok' });
+  assert.deepEqual(store.metadata, {});
+});
+
+// The following tests read the ALS store directly (see the note on the two
+// tests above) since msisdn/userId are auto-extracted request fields, not
+// something a caller passes to captureException() explicitly.
+function storeFromRequest(instance: VantaTrace, req: any, res: any): any {
+  let store: any;
+  instance.requestHandler()(req, res, () => {
+    store = requestStorage.getStore();
+  });
+  return store;
+}
+
+test('msisdn is read from the X-MSISDN header via req.get()', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'x-msisdn' ? '+1 (415) 555-2671' : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.msisdn, '+14155552671');
+});
+
+test('msisdn falls back to a plain x-msisdn header when req.get is unavailable', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.headers['x-msisdn'] = '923001234567';
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.msisdn, '923001234567');
+});
+
+test('msisdn is read from req.user.phone / mobilephone when no header is present', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+
+  const { req: req1, res: res1 } = fakeReqRes(200);
+  req1.user = { id: 'u1', phone: '+14155552671' };
+  assert.equal(storeFromRequest(instance, req1, res1).msisdn, '+14155552671');
+
+  const { req: req2, res: res2 } = fakeReqRes(200);
+  req2.user = { id: 'u1', mobilephone: '+14155552671' };
+  assert.equal(storeFromRequest(instance, req2, res2).msisdn, '+14155552671');
+});
+
+test('a value that does not look like a phone number is dropped, not forwarded', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.user = { id: 'u1', phone: 'not-a-phone-number' };
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.msisdn, undefined);
+});
+
+test('userId falls back to req.userId even when req.user exists but has no id fields', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.user = { email: 'user@example.com' }; // no id/_id/userId on req.user itself
+  req.userId = 'fallback-id-123';
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.userId, 'fallback-id-123');
+});
+
+test('userId prefers req.user._id when req.user.id is absent', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.user = { _id: 'mongo-object-id' };
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.userId, 'mongo-object-id');
+});
+
+test('an X-MPIN header is redacted before it ever leaves requestHandler(), not just at the backend', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'x-mpin' ? '1234' : undefined);
+  req.headers['x-mpin'] = '1234'; // also present as a plain header, as it would be over HTTP
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.headers['x-mpin'], '[REDACTED]');
+});
+
+test('other sensitive-shaped headers (auth, cookies, api keys) are still redacted after the refactor', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.headers = {
+    authorization: 'Bearer secret-token',
+    cookie: 'session=abc123',
+    'x-api-key': 'ep_live_abc',
+    'x-request-id': 'req-1', // not sensitive — should pass through untouched
+  };
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.headers.authorization, '[REDACTED]');
+  assert.equal(store.headers.cookie, '[REDACTED]');
+  assert.equal(store.headers['x-api-key'], '[REDACTED]');
+  assert.equal(store.headers['x-request-id'], 'req-1');
+});
+
+test('app version is captured from the X-APP-VERSION header via req.get()', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'x-app-version' ? '2.4.1' : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.appVersion, '2.4.1');
+});
+
+test('app version falls back to a plain x-app-version header when req.get is unavailable', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.headers['x-app-version'] = '3.0.0-beta.2';
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.appVersion, '3.0.0-beta.2');
+});
+
+test('rate limiting: exceeding maxPerFingerprintPerMinute drops later occurrences of the same error', () => {
+  _resetForTests();
+  const instance = new VantaTrace({
+    apiKey: 'k',
+    debug: false,
+    rateLimit: { maxPerMinute: 1000, maxPerFingerprintPerMinute: 3 }
+  });
+  const calls = spyOnCapture(instance);
+
+  // Same name/message/stack shape each time -> same fingerprint.
+  const makeErr = () => {
+    const e = new Error('downstream timeout');
+    e.stack = 'Error: downstream timeout\n    at handler (/app/routes.js:10:5)';
+    return e;
+  };
+
+  for (let i = 0; i < 5; i++) {
+    instance.captureException(makeErr());
+  }
+
+  assert.equal(calls.length, 5, 'captureException is still invoked each time — rate limiting happens inside it');
+  assert.equal(instance.getDropStats().rateLimitFingerprint, 2, '5 attempts - 3 allowed = 2 dropped');
+});
+
+test('rate limiting: maxPerMinute caps total volume even across different fingerprints', () => {
+  _resetForTests();
+  const instance = new VantaTrace({
+    apiKey: 'k',
+    debug: false,
+    rateLimit: { maxPerMinute: 2, maxPerFingerprintPerMinute: 1000 }
+  });
+
+  for (let i = 0; i < 4; i++) {
+    const e = new Error(`unique failure ${i}`);
+    instance.captureException(e);
+  }
+
+  assert.equal(instance.getDropStats().rateLimitGlobal, 2, '4 distinct-fingerprint attempts - 2 allowed globally = 2 dropped');
+});
+
+test('rate limiting does not apply in dry-run mode (no apiKey), but dry-run drops are still counted', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false, rateLimit: { maxPerMinute: 1 } });
+  for (let i = 0; i < 10; i++) {
+    instance.captureException(new Error(`err ${i}`));
+  }
+  const stats = instance.getDropStats();
+  assert.equal(stats.rateLimitGlobal, 0, 'dry-run returns before the rate limiter is ever consulted');
+  assert.equal(stats.apiKeyMissing, 10, 'every dry-run capture is counted so a misconfigured prod apiKey is production-visible');
+  assert.equal(stats.total, 10);
+});
+
+test('missing apiKey warns on construction even with debug: false', () => {
+  _resetForTests();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    new VantaTrace({ apiKey: '', debug: false });
+    assert.ok(
+      warnings.some((w) => w.includes('API key is missing')),
+      'a missing apiKey must be visible without needing debug: true — this is a total, silent capture failure'
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('no warning is logged on construction when apiKey is provided', () => {
+  _resetForTests();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    new VantaTrace({ apiKey: 'real-key', debug: false });
+    assert.equal(warnings.length, 0);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('_reportDropsIfAny surfaces apiKeyMissing drops in the periodic warning, independent of debug', () => {
+  _resetForTests();
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    const instance = new VantaTrace({ apiKey: '', debug: false });
+    warnings.length = 0; // discard the construction-time "API key is missing" warning
+    instance.captureException(new Error('a'));
+    instance.captureException(new Error('b'));
+
+    (instance as any)._reportDropsIfAny();
+
+    assert.ok(
+      warnings.some((w) => w.includes('apiKeyMissing=2') && w.includes('dry-run mode')),
+      'the 60s drop report calls out apiKeyMissing explicitly so it reads as actionable, not just a number'
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('getDropStats() aggregates rate-limit and transport-level drop counters together', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: 'k', debug: false, rateLimit: { maxPerMinute: 1 } });
+  instance.captureException(new Error('a'));
+  instance.captureException(new Error('b'));
+
+  const stats = instance.getDropStats();
+  assert.equal(stats.rateLimitGlobal, 1);
+  assert.equal(stats.total, 1);
+  // Transport-level fields are present (0 in this test — no backpressure/disabled-key scenario triggered).
+  assert.equal(stats.backpressureSoft, 0);
+  assert.equal(stats.backpressureHard, 0);
+});
+
+test('_reportDropsIfAny resets counters after logging, so a quiet interval reports nothing next time', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: 'k', debug: false, rateLimit: { maxPerMinute: 1 } });
+  instance.captureException(new Error('a'));
+  instance.captureException(new Error('b'));
+  assert.equal(instance.getDropStats().total, 1);
+
+  (instance as any)._reportDropsIfAny();
+  assert.equal(instance.getDropStats().total, 0, 'counters are reset after the periodic report');
+});
+
+test('caughtExceptions is auto-disabled in production without allowInProduction, with a warning', () => {
+  _resetForTests();
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { caughtExceptions: true } });
+    assert.equal((instance as any).stopCaughtWatcher, null, 'the watcher was never started');
+    assert.ok(warnings.some(w => w.includes('auto-disabled in production')), 'warns about the auto-disable');
+    instance.shutdown();
+  } finally {
+    console.warn = originalWarn;
+    process.env.NODE_ENV = originalEnv;
+  }
+});
+
+test('caughtExceptions.allowInProduction: true starts the watcher in production anyway', () => {
+  _resetForTests();
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (msg: string) => { warnings.push(msg); };
+
+  try {
+    const instance = new VantaTrace({
+      apiKey: '',
+      debug: false,
+      autoCapture: { caughtExceptions: { allowInProduction: true } }
+    });
+    assert.notEqual((instance as any).stopCaughtWatcher, null, 'the watcher was started');
+    assert.ok(warnings.some(w => w.includes('allowInProduction: true')), 'still warns that this is a risk, even when explicitly opted in');
+    instance.shutdown();
+  } finally {
+    console.warn = originalWarn;
+    process.env.NODE_ENV = originalEnv;
+  }
+});
+
+test('caughtExceptions starts normally outside production, without needing allowInProduction', () => {
+  _resetForTests();
+  const originalEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'development';
+
+  try {
+    const instance = new VantaTrace({ apiKey: '', debug: false, autoCapture: { caughtExceptions: true } });
+    assert.notEqual((instance as any).stopCaughtWatcher, null);
+    instance.shutdown();
+  } finally {
+    process.env.NODE_ENV = originalEnv;
+  }
+});
+
+test('requestHandler() generates a fresh W3C-shaped trace/span ID when there is no incoming traceparent', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.match(store.traceId, /^[0-9a-f]{32}$/);
+  assert.match(store.spanId, /^[0-9a-f]{16}$/);
+  assert.equal(store.parentSpanId, undefined);
+  assert.equal(store.traceparent, `00-${store.traceId}-${store.spanId}-01`);
+});
+
+test('requestHandler() continues an upstream trace from a valid incoming traceparent header', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  const upstreamTraceId = '0af7651916cd43dd8448eb211c80319c';
+  const upstreamSpanId = 'b7ad6b7169203331';
+  req.get = (name: string) => (name.toLowerCase() === 'traceparent' ? `00-${upstreamTraceId}-${upstreamSpanId}-01` : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.equal(store.traceId, upstreamTraceId, 'reuses the upstream trace ID rather than starting a new trace');
+  assert.equal(store.parentSpanId, upstreamSpanId, 'records the upstream span as this request\'s parent');
+  assert.match(store.spanId, /^[0-9a-f]{16}$/);
+  assert.notEqual(store.spanId, upstreamSpanId, 'this service gets its own new span ID, distinct from the parent');
+});
+
+test('requestHandler() ignores a malformed incoming traceparent header and starts a fresh trace', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+  req.get = (name: string) => (name.toLowerCase() === 'traceparent' ? 'garbage-not-a-traceparent' : undefined);
+
+  const store = storeFromRequest(instance, req, res);
+  assert.match(store.traceId, /^[0-9a-f]{32}$/);
+  assert.equal(store.parentSpanId, undefined);
+});
+
+test('the trace ID stays stable across multiple captures in the same request (set eagerly, not lazily regenerated)', () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const { req, res } = fakeReqRes(200);
+
+  let idBeforeAnyCapture: string | undefined;
+  let idAfterFirstCapture: string | undefined;
+  let idAfterSecondCapture: string | undefined;
+
+  instance.requestHandler()(req, res, () => {
+    idBeforeAnyCapture = VantaTrace.getActiveTraceId();
+    instance.captureException(new Error('first'));
+    idAfterFirstCapture = VantaTrace.getActiveTraceId();
+    instance.captureException(new Error('second'));
+    idAfterSecondCapture = VantaTrace.getActiveTraceId();
+  });
+
+  assert.ok(idBeforeAnyCapture, 'trace ID exists before any error is captured — proves eager assignment in requestHandler()');
+  assert.equal(idAfterFirstCapture, idBeforeAnyCapture);
+  assert.equal(idAfterSecondCapture, idBeforeAnyCapture);
+});
+
+test('outbound HTTP calls propagate the active request\'s traceparent header downstream', async () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const http = require('http');
+
+  const server = http.createServer((req: any, res: any) => {
+    (server as any)._receivedTraceparent = req.headers['traceparent'];
+    res.writeHead(200);
+    res.end('ok');
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+
+  const { req, res } = fakeReqRes(200);
+  let capturedTraceparent: string | undefined;
+
+  await new Promise<void>((resolve) => {
+    instance.requestHandler()(req, res, () => {
+      const store = requestStorage.getStore();
+      capturedTraceparent = store.traceparent;
+      const outbound = http.request({ hostname: '127.0.0.1', port, path: '/', method: 'GET' }, () => resolve());
+      outbound.end();
+    });
+  });
+
+  assert.equal((server as any)._receivedTraceparent, capturedTraceparent);
+  server.close();
+});
+
+test('outbound HTTP calls do not overwrite a traceparent header the caller already set explicitly', async () => {
+  _resetForTests();
+  const instance = new VantaTrace({ apiKey: '', debug: false });
+  const http = require('http');
+
+  const server = http.createServer((req: any, res: any) => {
+    (server as any)._receivedTraceparent = req.headers['traceparent'];
+    res.writeHead(200);
+    res.end('ok');
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+
+  const manualTraceparent = '00-11111111111111111111111111111111-2222222222222222-01';
+  const { req, res } = fakeReqRes(200);
+
+  await new Promise<void>((resolve) => {
+    instance.requestHandler()(req, res, () => {
+      const outbound = http.request(
+        { hostname: '127.0.0.1', port, path: '/', method: 'GET', headers: { traceparent: manualTraceparent } },
+        () => resolve()
+      );
+      outbound.end();
+    });
+  });
+
+  assert.equal((server as any)._receivedTraceparent, manualTraceparent);
+  server.close();
 });

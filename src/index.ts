@@ -1,21 +1,48 @@
-import { AsyncLocalStorage } from 'async_hooks';
 import * as crypto from 'crypto';
-import { VantaTraceOptions, VantaTraceContext, ErrorPayload } from './types';
+import { VantaTraceOptions, VantaTraceContext, ErrorPayload, Breadcrumb, Span, SpanType } from './types';
 import { normalizeError } from './normalizer';
 import { getSystemContext, startTelemetrySampling } from './context';
-import { sendPayload } from './transport';
+import { sendPayload, getTransportDropStats, resetTransportDropStats } from './transport';
 import { createWinstonTransport } from './winston';
 import { registerGlobalInstance } from './registry';
-import { deepScrub, scrubString, ScrubOptions } from './scrub';
+import { startCaughtExceptionWatcher, CaughtExceptionInfo } from './caught-exceptions';
+import { tryPatchPg, tryPatchMysql2, tryPatchIoredis } from './instrumentation';
+import { createMasker } from './masking';
+import { createRateLimiter, RateLimiter } from './rateLimiter';
+import { dynamicRequire } from './nodeRequire';
+import { requestStorage } from './store';
+import { patchConsole } from './consoleInstrumentation';
+import { patchHttp } from './httpInstrumentation';
+import { tryPatchPino } from './pino';
+import { finishAutoCapture } from './autoCaptureFinisher';
+import { buildRequestContext } from './requestContext';
+
+
+/** Cap on caught exceptions buffered per request while waiting for the response outcome. */
+const MAX_BUFFERED_CAUGHT_ERRORS = 20;
+/** Cap on spans (HTTP/DB/Redis sub-calls) recorded per request — oldest is dropped once exceeded. */
+const MAX_SPANS_PER_REQUEST = 100;
 
 export class VantaTrace {
   private apiKey: string;
   private debug: boolean;
   private apiUrl: string;
-  private scrubOptions: ScrubOptions;
+  // Auto-capture configuration (resolved from options.autoCapture)
+  private http5xxEnabled: boolean;
+  private http4xxEnabled: boolean;
+  private http4xxExclude: Set<number>;
+  private caughtReportPolicy: 'request-failure' | 'always';
+  private stopCaughtWatcher: (() => void) | null = null;
+  private masker: (value: any) => any;
+  private rateLimiter: RateLimiter;
+  private dropReportInterval: NodeJS.Timeout | null = null;
+  // Events silently discarded because no apiKey was configured (dry-run mode).
+  // The single most common "works locally, nothing shows up in production"
+  // cause — a prod deployment's env vars don't wire the key the same way a
+  // local .env does — so it gets the same production-visible treatment as
+  // every other drop reason (see getDropStats/_reportDropsIfAny).
+  private dryRunDropped = 0;
 
-  // native AsyncLocalStorage store to capture request context
-  private static asyncLocalStorage = new AsyncLocalStorage<VantaTraceContext>();
   // Memory leak-proof duplicate filter
   private reportedErrors = new WeakSet<any>();
   // Reentrance guard: prevents infinite loops when SDK debug logging
@@ -24,16 +51,17 @@ export class VantaTrace {
   // uncaughtException / console.error calls outside any request.
   private _globalReentranceGuard = false;
 
+
   /** Check if an error capture is already in progress for this async context. */
   private _isCapturing(): boolean {
-    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    const store = requestStorage.getStore() as any;
     if (store) return !!store._vantaCapturing;
     return this._globalReentranceGuard;
   }
 
   /** Set/clear the capture-in-progress flag for the current async context. */
   private _setCapturing(value: boolean): void {
-    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    const store = requestStorage.getStore() as any;
     if (store) {
       store._vantaCapturing = value;
     } else {
@@ -47,14 +75,63 @@ export class VantaTrace {
 
     // Default Ingestion Endpoint
     this.apiUrl = options.apiUrl || 'https://api.vantatrace.com/api/events';
+    this.masker = createMasker(options.maskingKeys || []);
+    this.rateLimiter = createRateLimiter(options.rateLimit || {});
 
-    this.scrubOptions = {
-      sensitiveKeys: options.sensitiveKeys,
-      sensitivePatterns: options.sensitivePatterns
-    };
+    // Not gated by `debug` — a missing key means every single event is
+    // silently discarded from now on, which is exactly the kind of
+    // production-invisible failure `debug: false` should never hide (same
+    // reasoning as the drop-visibility reporter below).
+    if (!options.apiKey) {
+      console.warn(
+        '[VantaTrace] WARNING: API key is missing — the SDK will run in dry-run mode and ' +
+        'silently discard every event (nothing will reach the dashboard). If this is production, ' +
+        'confirm the apiKey is actually wired into this process\'s environment/config — a value ' +
+        'that works via a local .env file often isn\'t set the same way in a deployed container/PM2/K8s ' +
+        'setup. Set `debug: true` to log each event that would have been sent.'
+      );
+    }
 
-    if (!options.apiKey && this.debug) {
-      console.warn('[VantaTrace] WARNING: API key is missing. SDK will run in dry-run mode.');
+    // Resolve auto-capture configuration
+    const autoCapture = options.autoCapture || {};
+    this.http5xxEnabled = autoCapture.http5xx !== false;
+    const clientErrorOpts = autoCapture.httpClientErrors;
+    this.http4xxEnabled = clientErrorOpts !== false;
+    const clientErrorExclude = typeof clientErrorOpts === 'object' && clientErrorOpts !== null ? clientErrorOpts.exclude : undefined;
+    this.http4xxExclude = new Set(clientErrorExclude || [401, 404]);
+    const caughtOpts = autoCapture.caughtExceptions;
+    const caughtConfig = typeof caughtOpts === 'object' && caughtOpts !== null ? caughtOpts : {};
+    this.caughtReportPolicy = caughtConfig.report || 'request-failure';
+
+    if (caughtOpts) {
+      const isProduction = process.env.NODE_ENV === 'production';
+
+      if (isProduction && !caughtConfig.allowInProduction) {
+        console.warn(
+          '[VantaTrace] WARNING: autoCapture.caughtExceptions was requested but is auto-disabled in production ' +
+          '(NODE_ENV=production). The V8 inspector watcher it relies on (Debugger.setPauseOnExceptions(\'all\')) ' +
+          'is a real operational risk — it can block the event loop and cause latency spikes on every thrown ' +
+          'exception, not just this feature\'s own overhead. Use @vantatrace/sdk/babel-plugin instead for ' +
+          'production-safe, compile-time try/catch instrumentation, or set ' +
+          'autoCapture.caughtExceptions.allowInProduction: true to enable it anyway.'
+        );
+      } else {
+        if (isProduction) {
+          console.warn(
+            '[VantaTrace] WARNING: Runtime caught-exception capture (V8 inspector watcher) is enabled in production ' +
+            '(allowInProduction: true). This is a high-risk operational choice that can block the event loop and ' +
+            'cause latency spikes. Consider using compile-time AST instrumentation (@vantatrace/babel-plugin) instead.'
+          );
+        }
+        this.stopCaughtWatcher = startCaughtExceptionWatcher(
+          (error, info) => this._recordCaughtException(error, info),
+          {
+            includeNodeModules: !!caughtConfig.includeNodeModules,
+            maxPerMinute: caughtConfig.maxPerMinute || 120,
+            debug: this.debug
+          }
+        );
+      }
     }
 
     if (this.debug) {
@@ -64,7 +141,91 @@ export class VantaTrace {
     // Start background system telemetry sampler (runs every 10 seconds, unrefed)
     startTelemetrySampling(10000);
 
+    // Periodic drop-visibility report — independent of `debug`, so a
+    // production deployment isn't blind to its own dropped events (rate
+    // limiting, sampling, transport backpressure, exhausted retries). Only
+    // logs when something was actually dropped in the interval; unrefed so
+    // it never keeps the process alive.
+    this.dropReportInterval = setInterval(() => this._reportDropsIfAny(), 60000);
+    this.dropReportInterval.unref?.();
+
+    // Initialize HTTP/HTTPS hooks for breadcrumbs + span timing
+    this._patchHttp();
+
+    // Best-effort DB/Redis client auto-instrumentation for the span waterfall —
+    // each is a no-op if the corresponding package isn't installed.
+    const startSpanFn: (type: SpanType, name: string) => { end: () => void } = (type, name) => this.startSpan(type, name);
+    tryPatchPg(startSpanFn, this.debug);
+    tryPatchMysql2(startSpanFn, this.debug);
+    tryPatchIoredis(startSpanFn, this.debug);
+
     registerGlobalInstance(this, this.debug);
+  }
+
+  /**
+   * Stop background instrumentation (the V8 inspector watcher). Useful for
+   * graceful shutdown and test teardown; safe to call multiple times.
+   */
+  public shutdown(): void {
+    if (this.stopCaughtWatcher) {
+      this.stopCaughtWatcher();
+      this.stopCaughtWatcher = null;
+    }
+    if (this.dropReportInterval) {
+      clearInterval(this.dropReportInterval);
+      this.dropReportInterval = null;
+    }
+  }
+
+  /**
+   * Snapshot of events dropped since the last periodic report (rate limiting,
+   * sampling, transport backpressure, exhausted retries, disabled API key).
+   * Poll this yourself for alerting, or rely on the automatic summary logged
+   * every 60 seconds when anything was actually dropped.
+   */
+  public getDropStats() {
+    const rl = this.rateLimiter.getDropStats();
+    const transport = getTransportDropStats();
+    return {
+      rateLimitGlobal: rl.rateLimitGlobal,
+      rateLimitFingerprint: rl.rateLimitFingerprint,
+      sampledOut: rl.sampledOut,
+      backpressureSoft: transport.backpressureSoft,
+      backpressureHard: transport.backpressureHard,
+      apiKeyDisabled: transport.apiKeyDisabled,
+      sendFailureExhausted: transport.sendFailureExhausted,
+      apiKeyMissing: this.dryRunDropped,
+      total:
+        rl.rateLimitGlobal + rl.rateLimitFingerprint + rl.sampledOut +
+        transport.backpressureSoft + transport.backpressureHard +
+        transport.apiKeyDisabled + transport.sendFailureExhausted +
+        this.dryRunDropped
+    };
+  }
+
+  /** Logs and resets the drop counters — called on the 60s interval; only warns when something was actually dropped. */
+  private _reportDropsIfAny(): void {
+    try {
+      const stats = this.getDropStats();
+      if (stats.total > 0) {
+        console.warn(
+          `[VantaTrace] WARNING: ${stats.total} event(s) dropped in the last ~60s — ` +
+          `rateLimitGlobal=${stats.rateLimitGlobal}, rateLimitFingerprint=${stats.rateLimitFingerprint}, ` +
+          `sampledOut=${stats.sampledOut}, backpressureSoft=${stats.backpressureSoft}, ` +
+          `backpressureHard=${stats.backpressureHard}, apiKeyDisabled=${stats.apiKeyDisabled}, ` +
+          `sendFailureExhausted=${stats.sendFailureExhausted}, apiKeyMissing=${stats.apiKeyMissing}. ` +
+          `Call getDropStats() to monitor this programmatically.` +
+          (stats.apiKeyMissing > 0
+            ? ' apiKeyMissing > 0 means the SDK has no apiKey configured and is running in dry-run mode — nothing is reaching the dashboard.'
+            : '')
+        );
+      }
+      this.rateLimiter.resetDropStats();
+      resetTransportDropStats();
+      this.dryRunDropped = 0;
+    } catch (_) {
+      // Never let reporting itself crash the sampler
+    }
   }
 
   /**
@@ -72,7 +233,7 @@ export class VantaTrace {
    * Links Winston/Pino log entries with the same VantaTrace error event on the dashboard.
    */
   private _generateTraceId(): string {
-    return crypto.randomBytes(16).toString('hex');
+    return crypto.randomUUID().replace(/-/g, '');
   }
 
   /**
@@ -80,7 +241,7 @@ export class VantaTrace {
    * Useful for linking custom Winston/Pino logger entries to VantaTrace error events.
    */
   public static getActiveTraceId(): string | undefined {
-    const store = VantaTrace.asyncLocalStorage.getStore() as any;
+    const store = requestStorage.getStore() as any;
     return store?.traceId;
   }
 
@@ -90,8 +251,14 @@ export class VantaTrace {
   public captureException(error: any, context?: VantaTraceContext): void {
     if (this._isCapturing()) return;
 
+    // Mark the active request as "an error was reported" so the auto-capture
+    // finalizer doesn't emit a duplicate/synthetic event for the same request.
+    const requestStore = requestStorage.getStore() as any;
+    if (requestStore) requestStore._vantaErrorCaptured = true;
+
     try {
       if (!this.apiKey) {
+        this.dryRunDropped++;
         if (this.debug) {
           console.log('[VantaTrace] Dry-run: captured exception:', error, 'Context:', context);
         }
@@ -107,10 +274,23 @@ export class VantaTrace {
       this._setCapturing(true);
 
       const normalized = normalizeError(error);
+
+      // Proactive volume control — checked before any of the more expensive
+      // work below (system context sampling, context merging, payload
+      // construction). Applies to every capture path (manual, uncaught,
+      // synthetic 4xx/5xx, caught-exception watcher) since they all funnel
+      // through this method.
+      if (!this.rateLimiter.shouldAllow(normalized.fingerprint)) {
+        if (this.debug) {
+          console.log(`[VantaTrace] Event rate-limited/sampled out: ${normalized.name} - ${normalized.message}`);
+        }
+        return;
+      }
+
       const systemContext = getSystemContext();
 
       // Auto-extract request-level context from AsyncLocalStorage store
-      const activeStore = VantaTrace.asyncLocalStorage.getStore() as any;
+      const activeStore = requestStorage.getStore() as any;
       
       // Retrieve or generate trace ID bound to this asynchronous context
       let traceId: string;
@@ -149,44 +329,29 @@ export class VantaTrace {
         }
       };
 
-      // Ensure req reference is removed from serialization scope
-      delete (mergedContext as any).req;
+      if (activeStoreCopy.startTime && !mergedContext.duration) {
+        mergedContext.duration = Date.now() - activeStoreCopy.startTime;
+      }
 
-      // Scrub PII/secrets before this payload ever leaves the process. Header
-      // redaction happens earlier (requestHandler), but error message/stack
-      // text, custom `extra` error properties, and metadata (which may include
-      // request body/query captured in requestHandler, or arbitrary fields a
-      // caller passed to captureException) can all carry embedded passwords,
-      // tokens, or PII that a key-name check alone wouldn't catch.
-      const scrubbedError = {
-        ...normalized,
-        message: scrubString(normalized.message, this.scrubOptions),
-        stack: scrubString(normalized.stack, this.scrubOptions),
-        extra: normalized.extra ? deepScrub(normalized.extra, this.scrubOptions) : normalized.extra,
-        cause: normalized.cause?.map((c) => ({
-          ...c,
-          message: scrubString(c.message, this.scrubOptions),
-          stack: scrubString(c.stack, this.scrubOptions)
-        }))
-      };
-      const scrubbedContext: VantaTraceContext = {
-        ...mergedContext,
-        // route can be re-derived from the live `req` reference (dynamicRoute
-        // above) after requestHandler already scrubbed its own copy — scrub
-        // again here so a raw req.url/path with an embedded query string
-        // (?password=...) can't bypass that via the dynamic-resolution path.
-        route: mergedContext.route ? scrubString(mergedContext.route, this.scrubOptions) : mergedContext.route,
-        metadata: mergedContext.metadata ? deepScrub(mergedContext.metadata, this.scrubOptions) : mergedContext.metadata
-      };
+      // Ensure req reference and SDK-internal bookkeeping are removed from serialization scope
+      const breadcrumbs = mergedContext.breadcrumbs || [];
+      delete (mergedContext as any).req;
+      delete (mergedContext as any).startTime;
+      delete (mergedContext as any)._vantaCapturing;
+      delete (mergedContext as any)._vantaErrorCaptured;
+      delete (mergedContext as any)._vantaCaughtErrors;
+      delete (mergedContext as any)._vantaResponseBody;
+      delete (mergedContext as any).breadcrumbs;
 
       const payload: ErrorPayload = {
         apiKey: this.apiKey,
         timestamp: new Date().toISOString(),
         traceId,
-        error: scrubbedError,
-        context: scrubbedContext,
+        error: normalized,
+        context: mergedContext,
         system: systemContext,
-        severity: mergedContext.severity || 'critical'
+        severity: mergedContext.severity || 'critical',
+        breadcrumbs
       };
 
       if (this.debug) {
@@ -231,64 +396,105 @@ export class VantaTrace {
    */
   public requestHandler() {
     return (req: any, res: any, next: any) => {
-      let userId = undefined;
-      if (req.user && typeof req.user === 'object') {
-        userId = req.user.id || req.user._id || req.user.userId;
-      } else if (req.userId) {
-        userId = req.userId;
-      }
+      const activeContext: any = buildRequestContext(req, () => this._generateTraceId(), (val) => this.maskData(val));
 
-      // Deep-sanitize request body and query — recursively, not just a couple
-      // of well-known top-level field names — since passwords/tokens/PII can
-      // be nested (e.g. { user: { password: '...' } }) or under a field name
-      // the SDK doesn't special-case.
-      const sanitizedBody = req.body && typeof req.body === 'object'
-        ? deepScrub(req.body, this.scrubOptions)
-        : undefined;
-      const sanitizedQuery = req.query && typeof req.query === 'object'
-        ? deepScrub(req.query, this.scrubOptions)
-        : undefined;
-
-      // Extract client IP
-      const ip = req.ip || (req.headers['x-forwarded-for'] as string) || req.socket?.remoteAddress;
-
-      // Extract and sanitize headers
-      const sanitizedHeaders: Record<string, any> = {};
-      const sensitiveHeaderKeys = ['authorization', 'cookie', 'set-cookie', 'x-api-key', 'proxy-authorization'];
-      const extraSensitiveKeys = (this.scrubOptions.sensitiveKeys || []).map((k) => k.toLowerCase());
-      if (req.headers && typeof req.headers === 'object') {
-        for (const [key, value] of Object.entries(req.headers)) {
-          const lowerKey = key.toLowerCase();
-          if (sensitiveHeaderKeys.includes(lowerKey) || extraSensitiveKeys.some((needle) => lowerKey.includes(needle))) {
-            sanitizedHeaders[key] = '[REDACTED]';
-          } else {
-            sanitizedHeaders[key] = value;
-          }
-        }
-      }
-
-      // The raw request URL may itself carry a query string (?password=...) —
-      // scrub it too rather than only the parsed req.query object.
-      const sanitizedRoute = scrubString(req.route?.path || req.path || req.url || '', this.scrubOptions);
-
-      const activeContext: any = {
-        req, // Keep active request reference to dynamically resolve user/route parameters later
-        userId: userId ? String(userId) : undefined,
-        route: sanitizedRoute,
-        method: req.method,
-        ip: ip ? String(ip) : undefined,
-        headers: sanitizedHeaders,
-        metadata: {
-          query: sanitizedQuery,
-          body: sanitizedBody
+      // Record the outgoing response body when the request ends up failing, so
+      // a swallowed try/catch (no exception object, no autoCapture.caughtExceptions)
+      // still surfaces *something* concrete about what went wrong — e.g. the
+      // `{ error: 'Order failed' }` a catch block sent back to the client.
+      // Whichever of res.json/res.send fires first wins; Express commonly calls
+      // one through the other internally, so the second call is a no-op here.
+      const recordResponseBody = (body: any) => {
+        if (activeContext._vantaResponseBody === undefined) {
+          activeContext._vantaResponseBody = body;
         }
       };
+      if (res && typeof res.json === 'function') {
+        const originalJson = res.json.bind(res);
+        res.json = (body: any) => {
+          try { recordResponseBody(body); } catch (_) {}
+          return originalJson(body);
+        };
+      }
+      if (res && typeof res.send === 'function') {
+        const originalSend = res.send.bind(res);
+        res.send = (body: any) => {
+          try { recordResponseBody(body); } catch (_) {}
+          return originalSend(body);
+        };
+      }
+
+      // Auto-capture: once the response has been sent, report swallowed errors
+      // for requests that failed with a 5xx status. 'finish' fires per response
+      // and the listener holds only this request's context object.
+      if (res && typeof res.on === 'function') {
+        res.on('finish', () => this._onRequestFinished(activeContext, req, res));
+      }
 
       // Wrap route execution scope under AsyncLocalStorage context
-      VantaTrace.asyncLocalStorage.run(activeContext, () => {
+      requestStorage.run(activeContext, () => {
         next();
       });
     };
+  }
+
+  /**
+   * Records an exception observed at its throw site by the V8 inspector watcher
+   * (see caught-exceptions.ts). Runs synchronously inside the throwing async
+   * context, so the request's AsyncLocalStorage store is still active.
+   */
+  private _recordCaughtException(error: any, info: CaughtExceptionInfo): void {
+    // Ignore exceptions raised by the SDK's own capture pipeline.
+    if (this._isCapturing()) return;
+
+    // Exceptions V8 predicts will escape every handler are already covered by
+    // errorHandler()/uncaughtException with richer semantics — skip them here.
+    if (info.uncaught) return;
+
+    if (this.caughtReportPolicy === 'always') {
+      this.captureException(error, {
+        severity: 'warning',
+        metadata: {
+          captureStrategy: 'caughtException',
+          handled: true,
+          throwSite: info.frameUrl || undefined
+        }
+      });
+      return;
+    }
+
+    // 'request-failure' policy: buffer on the active request and let the
+    // response outcome decide (see _onRequestFinished). Outside a request
+    // scope there is no outcome to correlate with, so the error is dropped.
+    const store = requestStorage.getStore() as any;
+    if (!store) return;
+    if (!store._vantaCaughtErrors) store._vantaCaughtErrors = [];
+    if (store._vantaCaughtErrors.length < MAX_BUFFERED_CAUGHT_ERRORS) {
+      store._vantaCaughtErrors.push(error);
+    }
+  }
+
+  /**
+   * Response finalizer for auto-capture. When a request ends with a failure
+   * status (5xx, or an eligible 4xx) and no exception was reported for it,
+   * this reports the real caught exception (when the inspector watcher
+   * recorded one) or a synthetic HttpServerError/HttpClientError so the
+   * failure is visible on the dashboard even when application code handled
+   * it gracefully (e.g. `res.status(400).json(...)` with no throw).
+   */
+  private _onRequestFinished(store: any, req: any, res: any): void {
+    finishAutoCapture(
+      {
+        http5xxEnabled: this.http5xxEnabled,
+        http4xxEnabled: this.http4xxEnabled,
+        http4xxExclude: this.http4xxExclude,
+        hasCaughtWatcher: !!this.stopCaughtWatcher,
+        captureException: (error, context) => this.captureException(error, context)
+      },
+      store,
+      req,
+      res
+    );
   }
 
   /**
@@ -311,32 +517,88 @@ export class VantaTrace {
   }
 
   /**
-   * Safe monkey-patching of console.error
+   * Safe monkey-patching of console logs to record breadcrumbs
    */
   private _patchConsole(): void {
-    const originalConsoleError = console.error;
     const self = this;
+    patchConsole({
+      isCapturing: () => self._isCapturing(),
+      captureException: (error, context) => self.captureException(error, context),
+      addBreadcrumb: (breadcrumb) => self.addBreadcrumb(breadcrumb)
+    });
+  }
 
-    console.error = function (...args: any[]) {
-      // Only CHECK the flag — do NOT set it here.
-      // captureException sets/clears it internally. Setting it here would
-      // cause captureException to see the flag and return early, silently
-      // dropping the error.
-      if (!self._isCapturing()) {
-        const error = args.find(arg => arg instanceof Error);
-        if (error) {
-          try {
-            self.captureException(error, {
-              severity: 'critical',
-              metadata: { source: 'Console Error Interception' }
-            });
-          } catch (err) {
-            // Fail-silent
-          }
+  /**
+   * Public helper to record manual breadcrumbs
+   */
+  public addBreadcrumb(breadcrumb: Omit<Breadcrumb, 'timestamp'>): void {
+    try {
+      const store = requestStorage.getStore() as any;
+      if (store) {
+        if (!store.breadcrumbs) store.breadcrumbs = [];
+        if (store.breadcrumbs.length >= 50) {
+          store.breadcrumbs.shift();
         }
+        store.breadcrumbs.push({
+          ...breadcrumb,
+          timestamp: new Date().toISOString()
+        });
       }
-      originalConsoleError.apply(console, args);
+    } catch (_) {}
+  }
+
+  /**
+   * Redacts fields matching `maskingKeys` (plus a small built-in default
+   * list) from an arbitrary object — used to sanitize log metadata pulled in
+   * from outside the SDK's own request context (e.g. a Winston log's data)
+   * before it's attached to a captured error or breadcrumb.
+   */
+  public maskData(value: any): any {
+    try {
+      return this.masker(value);
+    } catch (_) {
+      return value;
+    }
+  }
+
+  /**
+   * Starts a timed span (an outbound HTTP call, DB query, Redis command, or any
+   * custom sub-operation) scoped to the active request. Call `.end()` when the
+   * operation completes; recorded spans are attached to the next captured
+   * error on this request and rendered as a waterfall on the dashboard.
+   * A no-op outside a request scope (requestHandler() not in the call chain).
+   */
+  public startSpan(type: SpanType, name: string): { end: () => void } {
+    const store = requestStorage.getStore() as any;
+    const startTime = Date.now();
+    const id = crypto.randomUUID().replace(/-/g, '');
+    let ended = false;
+
+    return {
+      end: () => {
+        if (ended || !store) return;
+        ended = true;
+        try {
+          if (!store.spans) store.spans = [];
+          if (store.spans.length >= MAX_SPANS_PER_REQUEST) store.spans.shift();
+          const endTime = Date.now();
+          const span: Span = { id, type, name, startTime, endTime, duration: endTime - startTime };
+          store.spans.push(span);
+        } catch (_) {}
+      }
     };
+  }
+
+  /**
+   * Safe monkey-patching of outbound HTTP and HTTPS requests to log network breadcrumbs
+   */
+  private _patchHttp(): void {
+    const self = this;
+    patchHttp({
+      apiUrl: this.apiUrl,
+      addBreadcrumb: (breadcrumb) => self.addBreadcrumb(breadcrumb),
+      startSpan: (type, name) => self.startSpan(type, name)
+    });
   }
 
   /**
@@ -344,7 +606,7 @@ export class VantaTrace {
    */
   private _tryPatchWinston(): void {
     try {
-      const winston = require('winston');
+      const winston = dynamicRequire('winston');
       if (winston && winston.add) {
         const transport = createWinstonTransport(this);
         if (transport) {
@@ -363,44 +625,12 @@ export class VantaTrace {
    * Safe conditional patching of Pino
    */
   private _tryPatchPino(): void {
-    try {
-      const pino = require('pino');
-      if (pino && pino.prototype && pino.prototype.write) {
-        const originalWrite = pino.prototype.write;
-        const self = this;
-
-        pino.prototype.write = function (obj: any, msg: string, num: number) {
-          // Only CHECK the flag — captureException manages it internally.
-          if (!self._isCapturing()) {
-            let err: any = null;
-            if (obj && obj instanceof Error) {
-              err = obj;
-            } else if (obj && obj.err && obj.err instanceof Error) {
-              err = obj.err;
-            } else if (obj && obj.error && obj.error instanceof Error) {
-              err = obj.error;
-            }
-            if (err) {
-              try {
-                self.captureException(err, {
-                  severity: 'critical',
-                  metadata: { source: 'Pino Logger Interception' }
-                });
-              } catch (e) {
-                // Fail-silent
-              }
-            }
-          }
-          return originalWrite.call(this, obj, msg, num);
-        };
-
-        if (this.debug) {
-          console.log('[VantaTrace Debug] Successfully auto-patched Pino logging.');
-        }
-      }
-    } catch (e) {
-      // Pino is not present. Ignored.
-    }
+    const self = this;
+    tryPatchPino({
+      debug: this.debug,
+      isCapturing: () => self._isCapturing(),
+      captureException: (error, context) => self.captureException(error, context)
+    });
   }
 
   /**
@@ -422,7 +652,7 @@ export class VantaTrace {
 
     try {
       // Pull any surviving ALS context (route, userId, metadata) from the request that triggered the catch block
-      const activeStore = VantaTrace.asyncLocalStorage.getStore() as any || {};
+      const activeStore = requestStorage.getStore() as any || {};
 
       this.captureException(error, {
         severity: 'critical',
@@ -479,4 +709,7 @@ export class VantaTrace {
     this._tryPatchPino();
   }
 }
+export { flushAllQueues } from './transport';
+export * from './types';
+export { generateTraceId, generateSpanId, parseTraceParent, buildTraceParent, ParsedTraceParent } from './tracecontext';
 export default VantaTrace;
