@@ -1,12 +1,75 @@
 import { parseTraceParent, buildTraceParent, generateSpanId } from './tracecontext';
 
-// Substrings that mark a key (request body/query field, or header name)
-// as sensitive — matched case-insensitively anywhere in the key.
-const SENSITIVE_KEY_SUBSTRINGS = ['password', 'token', 'secret', 'auth', 'pin', 'creditcard', 'cvv', 'cookie', 'api-key'];
+/**
+ * Fragments that mark a key as sensitive wherever they appear in it, once
+ * separators are stripped — so `authToken`, `x-api-key`, `creditCardNumber`
+ * and `user_password` all match. Each one is long and distinctive enough
+ * that appearing inside a larger name is itself the signal.
+ */
+const SENSITIVE_KEY_FRAGMENTS = [
+  'password', 'passwd', 'pwd', 'secret', 'token', 'apikey', 'accesskey', 'privatekey',
+  'creditcard', 'cardnumber', 'cvv', 'cvc', 'ssn', 'cookie', 'authorization',
+  'credential', 'bearer', 'session', 'otp'
+];
+
+/**
+ * Short names that are only sensitive as a whole word. Matching these as
+ * fragments would redact ordinary fields — `pin` appears inside `shipping`,
+ * `pass` inside `passenger`, `auth` inside `author` — so they're compared
+ * against the key's own segments instead.
+ */
+const SENSITIVE_KEY_WORDS = new Set(['pin', 'mpin', 'pincode', 'pass', 'auth', 'key', 'mfa', '2fa']);
+
 const isSensitiveKey = (key: string): boolean => {
-  const lower = key.toLowerCase();
-  return SENSITIVE_KEY_SUBSTRINGS.some((s) => lower.includes(s));
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (SENSITIVE_KEY_FRAGMENTS.some((fragment) => normalized.includes(fragment))) return true;
+
+  // Split on separators and camelCase humps: `X-MPIN` -> [x, mpin],
+  // `shippingPin` -> [shipping, pin], `shipping` -> [shipping].
+  const words = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+
+  return words.some((word) => SENSITIVE_KEY_WORDS.has(word));
 };
+
+const MAX_REDACT_DEPTH = 6;
+const MAX_REDACT_ARRAY_ITEMS = 100;
+
+/**
+ * Recursively redacts values whose key matches `SENSITIVE_KEY_SUBSTRINGS`,
+ * at any depth and inside arrays.
+ *
+ * This is what makes body/query redaction substring-based, the same as the
+ * header check below: the injected `masker` only covers exact key-name
+ * matches (`token`, `password`), which is right for the `maskingKeys` option
+ * it serves but leaves compound names like `authToken`, `userPassword`,
+ * `creditCardNumber` or `sessionCookie` untouched. Those are the field names
+ * real request bodies actually use, so matching only exact names meant
+ * secrets left the process in the clear.
+ *
+ * Depth and array ceilings mirror the masker's so a deeply nested or huge
+ * body can't turn redaction into the expensive part of a capture.
+ */
+function deepRedactSensitiveKeys(value: any, depth = 0): any {
+  if (value === null || value === undefined || typeof value !== 'object') return value;
+  if (value instanceof Date || value instanceof Error) return value;
+  if (depth >= MAX_REDACT_DEPTH) return '[REDACTED_DEPTH_LIMIT]';
+
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, MAX_REDACT_ARRAY_ITEMS)
+      .map((item) => deepRedactSensitiveKeys(item, depth + 1));
+  }
+
+  const redacted: Record<string, any> = {};
+  for (const [key, item] of Object.entries(value)) {
+    redacted[key] = isSensitiveKey(key) ? '[REDACTED]' : deepRedactSensitiveKeys(item, depth + 1);
+  }
+  return redacted;
+}
 
 /**
  * Builds the per-request AsyncLocalStorage context object from an incoming
@@ -15,7 +78,14 @@ const isSensitiveKey = (key: string): boolean => {
  * extraction — no Express response wiring or AsyncLocalStorage.run() here,
  * since those need the SDK instance's own auto-capture finalizer.
  */
-export function buildRequestContext(req: any, generateTraceId: () => string, masker: (value: any) => any): any {
+export function buildRequestContext(
+  req: any,
+  generateTraceId: () => string,
+  // Optional: applies the instance's `maskingKeys` on top of the built-in
+  // substring redaction. Defaulted so the function is usable (and testable)
+  // without an SDK instance to borrow a masker from.
+  masker: (value: any) => any = (value) => value
+): any {
   const startTime = Date.now();
 
   // Unified fallback chain regardless of whether req.user is present as
@@ -56,8 +126,12 @@ export function buildRequestContext(req: any, generateTraceId: () => string, mas
     return /^\+?\d{7,15}$/.test(cleaned) ? cleaned : undefined;
   })();
 
-  const sanitizedBody: any = req.body && typeof req.body === 'object' ? masker(req.body) : undefined;
-  const sanitizedQuery: any = req.query && typeof req.query === 'object' ? masker(req.query) : undefined;
+  // Built-in substring redaction first, then the instance's custom
+  // `maskingKeys` — neither subsumes the other.
+  const sanitizedBody: any =
+    req.body && typeof req.body === 'object' ? masker(deepRedactSensitiveKeys(req.body)) : undefined;
+  const sanitizedQuery: any =
+    req.query && typeof req.query === 'object' ? masker(deepRedactSensitiveKeys(req.query)) : undefined;
 
   // Extract client IP & Geo headers
   const ip = req.ip || (req.headers && (req.headers['x-forwarded-for'] as string)) || req.socket?.remoteAddress;
