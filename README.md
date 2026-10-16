@@ -57,7 +57,7 @@ place.
 - 🪵 **Logger integrations** — auto-patches Winston and Pino to capture logged errors, no extra wiring
 - 🔒 **Secure by default** — automatic redaction of passwords, tokens, secrets, cookies, PINs, and card data in bodies, query strings, and headers alike
 - 🧩 **Zero-code instrumentation** — an optional Babel plugin injects capture calls into every `try/catch` at build time, with zero runtime overhead
-- 🌐 **Multi-service support** — a `serviceName` label per instance, built for microservice fleets
+- 🌐 **Multi-service support** — one project API key per service, so a fleet's events stay separated on the dashboard by the service that produced them
 - 🛡️ **Self-defending transport** — backpressure ceilings, retry, gzip, connection pooling, and an automatic kill-switch if your API key is disabled
 - 🚦 **Rate limiting with drop visibility** — global and per-fingerprint caps protect against event storms, with a production-visible (not just `debug`) summary of anything actually dropped
 - 🔗 **Distributed tracing (W3C Trace Context)** — extracts and propagates standard `traceparent` headers, so a trace continues correctly across service boundaries instead of restarting at every hop
@@ -94,8 +94,23 @@ import { VantaTrace } from '@vantatrace/sdk';
 
 const vantaTrace = new VantaTrace({
   apiKey: 'YOUR_PROJECT_API_KEY', // starts with ep_live_ or ep_test_
-  serviceName: 'checkout-service', // optional — labels events on the dashboard
-  debug: false
+  debug: false,
+
+  // ── try/catch capture ──────────────────────────────────────────────────
+  // Errors you handle yourself never reach Express's error middleware, so
+  // they need their own capture path. Step 4 below explains each layer.
+  autoCapture: {
+    // On by default. A request that answers 5xx with no error reported is
+    // recorded anyway, so a `catch { res.status(500).json(...) }` block
+    // can't hide the failure. 4xx is captured too, at warning severity.
+    http5xx: true,
+    httpClientErrors: true,
+
+    // Opt-in. Recovers the *real* Error object from inside your catch
+    // blocks (V8 inspector). Auto-disabled when NODE_ENV=production —
+    // use the Babel plugin there instead; see step 4.
+    caughtExceptions: process.env.NODE_ENV !== 'production'
+  }
 });
 ```
 
@@ -152,6 +167,66 @@ app.use((err, req, res, next) => {
 > `vantaTrace.expressMiddleware()` is deprecated but preserved as an alias for
 > `errorHandler()` for backward compatibility.
 
+### 4. Set Up try/catch Capture
+
+Steps 2 and 3 only see errors that **escape** your code. An error you catch
+yourself is, as far as Express and `process` are concerned, handled — so it
+reaches neither handler:
+
+```javascript
+app.get('/checkout', async (req, res) => {
+  try {
+    await chargeCard(req.body);
+  } catch (error) {
+    res.status(500).json({ error: 'Payment failed' }); // nothing escapes here
+  }
+});
+```
+
+Three layers cover that case, and which ones you want depends on where the
+code runs:
+
+```javascript
+const isProd = process.env.NODE_ENV === 'production';
+
+const vantaTrace = new VantaTrace({
+  apiKey: process.env.VANTATRACE_API_KEY,
+  autoCapture: {
+    // ① Already on — no config needed. The request above is reported as a
+    //    synthetic HttpServerError with the route, status and response body,
+    //    even though the Error object itself was swallowed. Safe everywhere.
+    http5xx: true,
+
+    // ②  Same idea for 4xx answers your code returns deliberately
+    //    (res.status(422).json(...)), at warning severity. 401 and 404 are
+    //    excluded by default as routine traffic.
+    httpClientErrors: true,
+
+    // ③ The real error object — `ReferenceError: a is not defined` with your
+    //    stack, not a synthetic placeholder. Powered by the V8 inspector, so
+    //    it costs ~0.3–0.5ms per *thrown* exception and is auto-disabled
+    //    under NODE_ENV=production unless you pass allowInProduction: true.
+    caughtExceptions: !isProd
+  }
+});
+```
+
+For layer ③ **in production**, use the Babel plugin instead: it injects the
+capture call into every `catch` block at build time, so there is no inspector
+attached and no runtime cost at all.
+
+```json
+// .babelrc — zero-overhead equivalent of caughtExceptions, suitable for prod
+{
+  "presets": ["@babel/preset-env"],
+  "plugins": ["@vantatrace/sdk/babel-plugin"]
+}
+```
+
+Full detail on each layer: [4a. Failed-request safety net](#4a-failed-request-safety-net-enabled-by-default),
+[4b. Deep capture via the V8 inspector](#4b-deep-capture-via-the-v8-inspector-opt-in),
+and [Zero-Code Auto-Capture (Babel Plugin)](#zero-code-auto-capture-babel-plugin).
+
 That's the whole setup. Everything below documents what each piece does and
 how to go further — manual capture, catching swallowed errors, breadcrumbs,
 logger integrations, and the zero-code Babel plugin.
@@ -165,7 +240,6 @@ Options passed to `new VantaTrace({ ... })`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `apiKey` | `string` | — | **Required.** Your VantaTrace project API key. If omitted, the SDK runs in dry-run mode — every event is silently discarded (a production-visible warning is logged regardless of `debug`; set `debug: true` to also log each event that would have been sent). |
-| `serviceName` | `string` | — | Logical service name attached to every event — how you tell microservices apart on the dashboard. |
 | `apiUrl` | `string` | `https://api.vantatrace.com/api/events` | Override the ingestion endpoint (self-hosted/enterprise deployments). |
 | `debug` | `boolean` | `false` | Logs SDK internals to the console — capture attempts, batch sends, retries, disabled-key state. |
 | `autoCapture.http5xx` | `boolean` | `true` | Emit a synthetic error when a request finishes 5xx with no exception reported (see [4a](#automatic-capture-of-trycatch-errors)). |
@@ -714,20 +788,45 @@ then rethrown to `uncaughtException`) is only ever reported once.
 ## Security & Data Redaction
 
 Sensitive fields are automatically redacted — in the request body, the query
-string, and HTTP headers alike — using a case-insensitive substring match
-against the field/header name:
+string, and HTTP headers alike — by matching the field/header name
+case-insensitively, at any depth and inside arrays.
+
+Two rules, because one alone gets it wrong. Long, distinctive fragments match
+anywhere in the name, once separators are stripped:
 
 ```
-password · token · secret · auth (matches authorization, proxy-authorization)
-pin (matches mpin, x-mpin) · creditcard · cvv · cookie (matches set-cookie)
-api-key (matches x-api-key)
+password · passwd · pwd · secret · token · apikey · accesskey · privatekey
+creditcard · cardnumber · cvv · cvc · ssn · cookie · authorization
+credential · bearer · session · otp
 ```
 
-A field or header matching any of these is replaced with `[REDACTED]` before
-the event ever leaves your process — this happens in `requestHandler()`
-itself, independent of any additional scrubbing your VantaTrace backend
-applies as defense-in-depth. This is why an `X-MPIN` header is redacted the
-same way a `password` body field is.
+So `authToken`, `user_password`, `creditCardNumber`, `x-api-key`,
+`sessionCookie` and `proxy-authorization` are all redacted — the compound
+names real payloads actually use, not just exact matches.
+
+Short names match only as a whole word in the key (split on `-`, `_` and
+camelCase humps):
+
+```
+pin · mpin · pincode · pass · auth · key · mfa · 2fa
+```
+
+That boundary is the point: `pin` as a fragment would redact `shipping`,
+`pass` would redact `passenger`, and `auth` would redact `author`. As words
+they still catch `X-MPIN`, `shippingPin` and a bare `auth` field.
+
+Anything matching is replaced with `[REDACTED]` in `requestHandler()` before
+the event leaves your process, independent of the ingestion worker's own
+defense-in-depth scrubbing. Add your own names with
+[`maskingKeys`](#masking-log-metadata).
+
+> [!NOTE]
+> Key names are what the SDK matches on. A secret pasted into free text —
+> inside an error message, a stack frame or a raw URL — is scrubbed by the
+> ingestion worker (`Bearer <token>`, JWTs, `key=value` pairs, SSNs,
+> card-shaped digit runs, email addresses) rather than client-side, so it is
+> redacted before storage but does travel to the ingestion endpoint. Don't
+> interpolate credentials into error messages you throw.
 
 ---
 
@@ -884,8 +983,15 @@ vantaTrace.captureException(error, {
 Construct one `VantaTrace` instance per process — typically once, in your
 entrypoint — and reuse it everywhere in that service via your own module
 export or dependency injection. For a fleet of microservices, give each
-service its own project API key (or the same key with a different
-`serviceName`) and its own instance.
+service its own project API key and its own instance.
+
+**The service label comes from the API key, not from the SDK.** Events are
+tagged with the name of the VantaTrace project the key belongs to, which the
+ingestion API attaches server-side — there is no client-side option that
+sets or overrides it. So "one project per service" is what makes the
+dashboard's per-service breakdown, the service filter and the `Service:`
+line in Slack alerts meaningful; two services sharing one key are
+indistinguishable once their events arrive.
 
 > [!NOTE]
 > The [Babel plugin](#zero-code-auto-capture-babel-plugin)'s injected
@@ -915,6 +1021,14 @@ service its own project API key (or the same key with a different
 - If you're relying on `autoCapture.http5xx`/`caughtExceptions` for errors
   swallowed by a `try/catch`, confirm the request actually returned 5xx —
   the safety net only fires for failed requests by default.
+
+**`autoCapture.caughtExceptions: true` but no caught exceptions reported in
+production?** That's the documented default: the V8 inspector watcher is
+auto-disabled when `NODE_ENV=production` and a startup warning says so. Either
+add the [Babel plugin](#zero-code-auto-capture-babel-plugin) (recommended — same
+capture, no runtime cost) or set
+`autoCapture.caughtExceptions.allowInProduction: true`. See
+[4b](#4b-deep-capture-via-the-v8-inspector-opt-in).
 
 **`userId`/`appVersion` always empty?** See the callouts under
 [Automatic Context Enrichment](#automatic-context-enrichment) — both are

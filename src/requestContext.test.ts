@@ -116,6 +116,62 @@ test('leaves body/query undefined when the request has none', () => {
   assert.equal(ctx.query, undefined);
 });
 
+test('redacts sensitive keys nested in objects and inside arrays, not just at the top level', () => {
+  const ctx = buildRequestContext(
+    fakeReq({
+      body: {
+        order: { id: 'ord_1', payment: { cardNumber: '4111111111111111', holder: 'Ali' } },
+        attempts: [{ refreshToken: 'rt-1' }, { note: 'retry' }]
+      }
+    }),
+    genTraceId
+  );
+  assert.equal(ctx.body.order.id, 'ord_1');
+  assert.equal(ctx.body.order.payment.holder, 'Ali');
+  assert.equal(ctx.body.order.payment.cardNumber, '[REDACTED]');
+  assert.equal(ctx.body.attempts[0].refreshToken, '[REDACTED]');
+  assert.equal(ctx.body.attempts[1].note, 'retry');
+});
+
+test('does not redact ordinary fields whose names merely contain a short sensitive word', () => {
+  // 'shipping' contains 'pin', 'passenger' contains 'pass', 'author' contains
+  // 'auth' — matching those as substrings would redact real payload data.
+  const ctx = buildRequestContext(
+    fakeReq({
+      body: { shipping: { city: 'Lahore' }, passenger: 'Ali', author: 'Sara', keyword: 'retry', shippingPin: '54000' }
+    }),
+    genTraceId
+  );
+  assert.deepEqual(ctx.body.shipping, { city: 'Lahore' });
+  assert.equal(ctx.body.passenger, 'Ali');
+  assert.equal(ctx.body.author, 'Sara');
+  assert.equal(ctx.body.keyword, 'retry');
+  // ...but a field that really is a PIN still goes.
+  assert.equal(ctx.body.shippingPin, '[REDACTED]');
+});
+
+test('a supplied masker runs in addition to the built-in redaction, not instead of it', () => {
+  // Stands in for the instance masker built from `maskingKeys`: exact-name
+  // matching for a domain-specific field the built-in substrings miss.
+  const masker = (value: any) => {
+    if (!value || typeof value !== 'object') return value;
+    const out: Record<string, any> = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = key.toLowerCase() === 'cnic' ? '[REDACTED]' : item;
+    }
+    return out;
+  };
+
+  const ctx = buildRequestContext(
+    fakeReq({ body: { cnic: '35202-1234567-1', authToken: 'abc', city: 'Lahore' } }),
+    genTraceId,
+    masker
+  );
+  assert.equal(ctx.body.cnic, '[REDACTED]');
+  assert.equal(ctx.body.authToken, '[REDACTED]');
+  assert.equal(ctx.body.city, 'Lahore');
+});
+
 test('redacts sensitive-looking header names, including an X-MPIN header, without mutating other headers', () => {
   const ctx = buildRequestContext(
     fakeReq({ headers: { 'x-mpin': '4821', 'content-type': 'application/json', authorization: 'Bearer abc' } }),

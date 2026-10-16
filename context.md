@@ -6,7 +6,7 @@ This document provides a comprehensive technical overview of the `@vantatrace/sd
 
 ## 📂 SDK Module Structure
 
-The SDK is located in the `sdk/` subdirectory. Its codebase is structured as follows:
+The SDK is this repository's root. Its codebase is structured as follows:
 
 - **`src/types.ts`**: Defines typescript interfaces for configuration (`VantaTraceOptions`, `AutoCaptureOptions`, `CaughtExceptionCaptureOptions`, `RateLimitOptions`), context payload (`VantaTraceContext`), breadcrumbs, spans, and the final payload structure (`ErrorPayload`).
 - **`src/index.ts`**: The main entry point containing the core `VantaTrace` class, which coordinates initialization, context management, monkey patching, and exception capturing.
@@ -14,9 +14,9 @@ The SDK is located in the `sdk/` subdirectory. Its codebase is structured as fol
 - **`src/transport.ts`**: Asynchronous batching, gzip compression, HTTP/HTTPS keep-alive connection pooling, exponential retry with jitter, backpressure queues, and the automatic disabled-key kill switch.
 - **`src/caught-exceptions.ts`**: Implements the V8 inspector watcher via `node:inspector` to intercept caught exceptions from `try/catch` blocks at runtime.
 - **`src/instrumentation.ts`**: Best-effort automatic patching of DB/Redis clients (`pg`, `mysql2`, `ioredis`) to record timed query spans.
-- **`src/masking.ts`**: Contextual data masking for PII/secrets (passwords, tokens, CVVs, cookies, PINs, bank accounts, CNIC) using substring case-insensitive matching.
+- **`src/masking.ts`**: Exact key-name masking (case-insensitive) for metadata pulled in from outside the SDK's request context — Winston/Pino log objects — driven by the built-in list plus the project's `maskingKeys`. Exact match is deliberate here: a custom key like `ConsumerName` shouldn't also redact `ConsumerNameVerified`.
 - **`src/rateLimiter.ts`**: Implements global and per-fingerprint rate limiting with sampling.
-- **`src/requestContext.ts`**: Helper to build request-level context from Express req/res objects.
+- **`src/requestContext.ts`**: Helper to build request-level context from Express req/res objects. Also owns redaction for request bodies, query strings and headers: distinctive fragments (`password`, `token`, `apikey`, `creditcard`, …) match anywhere in a key, while short names (`pin`, `pass`, `auth`, `key`) match only as whole key segments, so `authToken` is redacted and `shipping` is not.
 - **`src/tracecontext.ts`**: Handles parsing/propagation of W3C `traceparent` headers for distributed tracing.
 - **`src/consoleInstrumentation.ts`**: Monkey-patches global `console` output to capture logs as breadcrumbs/exceptions.
 - **`src/httpInstrumentation.ts`**: Monkey-patches global Node `http`/`https` calls to capture outgoing request breadcrumbs.

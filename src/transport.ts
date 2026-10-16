@@ -5,6 +5,7 @@ import * as dns from 'dns';
 import * as zlib from 'zlib';
 import * as crypto from 'crypto';
 import * as path from 'path';
+import * as fs from 'fs';
 import { ErrorPayload } from './types';
 
 // Pre-computed SHA-256 hash cache to avoid re-hashing on every send
@@ -118,6 +119,21 @@ function getWorker(): import('worker_threads').Worker | null {
     const { Worker } = require('worker_threads');
     // Ensure we resolve the .js extension because we're running in compiled dist/
     let workerPath = path.join(__dirname, 'transportWorker.js');
+
+    // Check the worker file exists before handing a batch to a worker that
+    // can't load it. `new Worker()` returns an object that only fails later,
+    // asynchronously, via the 'error' handler below — by which point the
+    // batch has already been postMessage'd and is gone, since the worker
+    // protocol has no per-batch ack to replay from. Running from TypeScript
+    // source (no dist/) and a packaging slip that omits transportWorker.js
+    // both land here, so failing over before the first send is what keeps
+    // those events from being silently dropped.
+    if (!fs.existsSync(workerPath)) {
+      useWorker = false;
+      worker = null;
+      return null;
+    }
+
     try {
       worker = new Worker(workerPath);
       worker!.on('message', (msg: any) => {
