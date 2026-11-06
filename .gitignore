@@ -19,3 +19,14 @@ Thumbs.db
 
 # Subagent-driven-development scratch state
 .superpowers/
+
+# Implementation notes: design docs, task plans and anything else written
+# while building a feature. These are internal working notes, and this
+# repository is public — the published documentation is README.md, and the
+# npm package ships only what `files` in package.json lists (dist/ and
+# babel-plugin.js), so nothing here ever reached the package anyway.
+#
+# To publish something from here deliberately, either add it with
+# `git add -f <path>` or un-ignore its folder with a `!docs/<name>/` line
+# below this one.
+docs/
