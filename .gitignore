@@ -30,3 +30,7 @@ Thumbs.db
 # `git add -f <path>` or un-ignore its folder with a `!docs/<name>/` line
 # below this one.
 docs/
+
+# Internal architecture reference kept for whoever picks the work up.
+# README.md is the documentation this project publishes.
+context.md
